@@ -52,16 +52,27 @@ func TestRenderBodyTemplate(t *testing.T) {
 	if got := PushTitle(evt); got != "摄像头camera-01 发生-移动侦测" {
 		t.Errorf("PushTitle = %q", got)
 	}
-	if got := PushContent(evt); !strings.Contains(got, "摄像头camera-01 发生了移动侦测事件，触发时间 2026-11-10 16:00:00") {
-		t.Errorf("PushContent = %q", got)
+	// 触发时间优先取 ReceivedAt（TP-Link 的设备 utcTime 在订阅期内冻结不更新）
+	want := "摄像头：camera-01\n事件：发生了移动侦测事件\n触发时间：2026-11-10 16:00:01"
+	if got := PushContent(evt); got != want {
+		t.Errorf("PushContent = %q, want %q", got, want)
 	}
 	tpl := `{"title":"{title}","content":"{content}"}`
 	out := RenderBodyTemplate(tpl, evt)
-	if !strings.Contains(out, `"摄像头camera-01 发生-移动侦测"`) || !strings.Contains(out, "发生了移动侦测事件") {
+	if !strings.Contains(out, `"摄像头camera-01 发生-移动侦测"`) || !strings.Contains(out, `发生了移动侦测事件`) {
 		t.Errorf("RenderBodyTemplate = %q", out)
+	}
+	// 多行内容嵌入 JSON 模板时必须转义为 \n，否则 JSON 失效
+	if !strings.Contains(out, `\n事件：发生了移动侦测事件\n`) {
+		t.Errorf("换行未转义为 \\n: %q", out)
 	}
 	if !json.Valid([]byte(out)) {
 		t.Errorf("渲染结果不是合法 JSON: %q", out)
+	}
+	// 特殊字符（引号/反斜杠）也要转义后才能保持 JSON 合法
+	evt.Title = `带"引号"的\事件`
+	if out := RenderBodyTemplate(tpl, evt); !json.Valid([]byte(out)) {
+		t.Errorf("含特殊字符时渲染结果不是合法 JSON: %q", out)
 	}
 	if RenderBodyTemplate("{}", evt) != "{}" {
 		t.Errorf("无占位符模板应原样输出")
@@ -112,35 +123,38 @@ func dedupEvent(device, topic, op string, data map[string]string) Event {
 		Data: data, Source: map[string]string{"Source": "CellMotionDetector"}}
 }
 
-func TestDedupSuppressesHeartbeatButKeepsTransitions(t *testing.T) {
+func TestDedupCooldownSuppressesFlapping(t *testing.T) {
 	d := newTestDispatcher(60)
 	topic := "tns1:RuleEngine/CellMotionDetector/Motion"
 	on := map[string]string{"Motion": "true"}
 	off := map[string]string{"Motion": "false"}
 
-	// 1. 开始事件通过
+	// 1. 首个事件通过
 	if d.isDuplicate(dedupEvent("cam", topic, "Changed", on)) {
-		t.Fatal("首次 Motion=true 不应被判重")
+		t.Fatal("首次事件不应被判重")
 	}
 	// 2. 心跳重复（新 device_time，键不含时间）被抑制
 	if !d.isDuplicate(dedupEvent("cam", topic, "Changed", on)) {
-		t.Fatal("TTL 内重复 Motion=true 应被判重（心跳风暴）")
+		t.Fatal("TTL 内重复同状态应被判重（心跳风暴）")
 	}
-	// 3. 结束事件（true→false）必须放行
-	if d.isDuplicate(dedupEvent("cam", topic, "Changed", off)) {
-		t.Fatal("Motion=false（事件结束）不应被判重")
-	}
-	// 4. 真实连续触发（false→true，状态已变化）必须放行
-	if d.isDuplicate(dedupEvent("cam", topic, "Changed", on)) {
-		t.Fatal("false→true 的再次触发不应被判重")
-	}
-	// 5. on→off 仍是状态变化（再次结束），放行
-	if d.isDuplicate(dedupEvent("cam", topic, "Changed", off)) {
-		t.Fatal("on→false 的再次结束不应被判重")
-	}
-	// 6. false 状态的心跳重复被抑制
+	// 3. TTL 内的状态变化（true→false 侦测抖动）被冷却抑制——
+	//    实测 TP-Link 会在 1 分钟内翻转 8 次，若放行会连发 8 条推送
 	if !d.isDuplicate(dedupEvent("cam", topic, "Changed", off)) {
-		t.Fatal("TTL 内连续重复 Motion=false 应被判重")
+		t.Fatal("TTL 内状态变化应被冷却窗口抑制")
+	}
+	// 4. 抖回去（false→true）同样抑制
+	if !d.isDuplicate(dedupEvent("cam", topic, "Changed", on)) {
+		t.Fatal("TTL 内再次状态变化应被冷却窗口抑制")
+	}
+	// 5. 冷却过期后重新放行（抑制时不刷新窗口）
+	d.seenMu.Lock()
+	for k, s := range d.seen {
+		s.expiresAt = time.Now().Add(-time.Second)
+		d.seen[k] = s
+	}
+	d.seenMu.Unlock()
+	if d.isDuplicate(dedupEvent("cam", topic, "Changed", off)) {
+		t.Fatal("冷却过期后应重新放行")
 	}
 }
 

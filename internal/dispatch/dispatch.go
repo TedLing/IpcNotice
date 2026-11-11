@@ -190,13 +190,12 @@ type Dispatcher struct {
 	seen   map[string]dedupState
 }
 
-// dedupState 记录某条「设备+主题+操作+来源」上次出现的事件状态值。
-// 去重是「状态抑制」而不是「按 Topic 盲杀」：只有同一状态在 TTL 内重复出现
-// （如 TP-Link 每秒重发的 Motion=true 心跳、多个订阅实例推送同一状态）才被抑制；
-// 状态值变化（Motion=true→false 的结束、false→true 的再次触发）永远放行。
+// dedupState 记录某条「设备+主题+操作+来源」的冷却截止时间。
+// 去重是「冷却窗口」：键首次出现放行，窗口内的所有后续事件——同状态心跳、
+// 多订阅实例重发、以及 TP-Link 侦测抖动造成的 true/false 快速翻转——一律抑制；
+// 窗口过期后下一个事件重新放行并开启新冷却。抑制时不刷新窗口，
+// 因此持续抖动最多每个 TTL 窗口收到一次推送。
 type dedupState struct {
-	data      string
-	source    string
 	expiresAt time.Time
 }
 
@@ -300,8 +299,8 @@ func (d *Dispatcher) Submit(dev *config.DeviceConfig, transport string, msgs []o
 	}
 }
 
-// isDuplicate 按「设备 + 主题 + 操作 + 来源」记住最近一次的状态值，在 TTL 内抑制
-// 同一状态的重复推送；状态值一旦变化立即放行并刷新记录。
+// isDuplicate 按「设备 + 主题 + 操作 + 来源」维护冷却窗口：键首次出现放行，
+// 窗口内的所有后续事件（同状态心跳 + 状态快速抖动）一律抑制，过期后重新放行。
 func (d *Dispatcher) isDuplicate(evt Event) bool {
 	d.mu.RLock()
 	ttl := d.dedupTTL
@@ -312,8 +311,6 @@ func (d *Dispatcher) isDuplicate(evt Event) bool {
 	key := strings.Join([]string{
 		evt.Device, util.NormalizeTopic(evt.Topic), evt.Operation, util.JSONDump(evt.Source),
 	}, "\x00")
-	data := util.JSONDump(evt.Data)
-	source := util.JSONDump(evt.Source)
 
 	d.seenMu.Lock()
 	defer d.seenMu.Unlock()
@@ -325,10 +322,10 @@ func (d *Dispatcher) isDuplicate(evt Event) bool {
 			}
 		}
 	}
-	if s, ok := d.seen[key]; ok && now.Before(s.expiresAt) && s.data == data && s.source == source {
+	if s, ok := d.seen[key]; ok && now.Before(s.expiresAt) {
 		return true
 	}
-	d.seen[key] = dedupState{data: data, source: source, expiresAt: now.Add(ttl)}
+	d.seen[key] = dedupState{expiresAt: now.Add(ttl)}
 	return false
 }
 
@@ -452,9 +449,11 @@ func PushTitle(evt Event) string {
 	return fmt.Sprintf("摄像头%s 发生-%s", evt.Device, evt.Title)
 }
 
-// PushContent 组装占位符 {content}：摄像头名称 + 发生了什么事件 + 触发时间。
+// PushContent 组装占位符 {content}：多行文本——摄像头名称 / 事件描述 / 触发时间。
+// 换行符是真实换行；渲染进 JSON 模板时由 RenderBodyTemplate 做 JSON 转义（\n）。
 func PushContent(evt Event) string {
-	return fmt.Sprintf("摄像头%s 发生了%s事件，触发时间 %s", evt.Device, evt.Title, FormatEventTime(evt))
+	return fmt.Sprintf("摄像头：%s\n事件：发生了%s事件\n触发时间：%s",
+		evt.Device, evt.Title, FormatEventTime(evt))
 }
 
 // cst 是中国标准时间（UTC+8）。通知时间统一按此时区展示，避免依赖运行机器
@@ -467,10 +466,12 @@ var cst = func() *time.Location {
 	return loc
 }()
 
-// FormatEventTime 优先设备时间，其次本机接收时间，都解析失败时原样返回。
+// FormatEventTime 优先本机接收时间，其次设备时间，都解析失败时原样返回。
+// TP-Link 固件推送消息里的 utcTime 在订阅期内不更新（冻结在订阅建立时刻），
+// 直接展示会造成触发时间严重偏差；推送链路里 ReceivedAt 与真实触发时刻相差毫秒级。
 // 解析成功后固定按中国时区（UTC+8）展示，不随运行机器时区变化。
 func FormatEventTime(evt Event) string {
-	for _, s := range []string{evt.DeviceTime, evt.ReceivedAt} {
+	for _, s := range []string{evt.ReceivedAt, evt.DeviceTime} {
 		if s == "" {
 			continue
 		}
@@ -482,11 +483,22 @@ func FormatEventTime(evt Event) string {
 	return time.Now().In(cst).Format("2006-01-02 15:04:05")
 }
 
+// jsonEscape 把文本安全嵌入 JSON 模板的字符串值：换行转义为 \n、引号转义为 \"、
+// 反斜杠与控制字符同样处理。模板是 JSON 文本，裸换行会直接破坏 JSON 合法性。
+func jsonEscape(s string) string {
+	b, err := json.Marshal(s)
+	if err != nil {
+		return s
+	}
+	return string(b[1 : len(b)-1])
+}
+
 // RenderBodyTemplate 把请求体模板里的 {title} / {content} 占位符替换为实际内容。
-// 模板本身是 JSON 文本，占位符写在字符串值里；未出现占位符则原样输出。
+// 模板本身是 JSON 文本，占位符写在字符串值里；替换值先做 JSON 转义，
+// 保证多行内容（\n）、引号等不会破坏模板结构。未出现占位符则原样输出。
 func RenderBodyTemplate(tpl string, evt Event) string {
-	out := strings.ReplaceAll(tpl, "{title}", PushTitle(evt))
-	out = strings.ReplaceAll(out, "{content}", PushContent(evt))
+	out := strings.ReplaceAll(tpl, "{title}", jsonEscape(PushTitle(evt)))
+	out = strings.ReplaceAll(out, "{content}", jsonEscape(PushContent(evt)))
 	return out
 }
 

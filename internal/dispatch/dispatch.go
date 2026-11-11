@@ -191,11 +191,13 @@ func (rt *RouteTable) match(device, topic string) (bool, []store.WebhookChannel,
 // Dispatcher 把事件记录到日志 / JSONL / SQLite，并按订阅路由异步推送到 webhook 通道。
 // ONVIF 的 handler 只做入队，绝不阻塞订阅轮询循环。
 type Dispatcher struct {
-	store  *store.Store
-	client *http.Client
-	queue  chan dispatchItem
-	wg     sync.WaitGroup
-	log    *slog.Logger
+	store *store.Store
+	// webhookClient 可原子整体替换：configure() 热更新 Webhook 超时后换新客户端，
+	// 旧客户端被进行中的请求持有，不影响在途推送。
+	webhookClient atomic.Pointer[http.Client]
+	queue         chan dispatchItem
+	wg            sync.WaitGroup
+	log           *slog.Logger
 
 	mu           sync.RWMutex
 	closed       bool
@@ -212,12 +214,12 @@ type Dispatcher struct {
 	smStates     map[string]*eventState
 	smMu         sync.Mutex
 	smStop       chan struct{}
-	smNow        func() time.Time // 可注入时钟（测试用）
+	smNow        func() time.Time         // 可注入时钟（测试用）
 	deviceHealth func(device string) bool // nil 时视为全部健康
 }
 
 // dispatchItem 是分发队列的一条记录。route 非 nil 时使用显式路由
-//（sustained 原始事件仅落库、生命周期通知走指定通道），否则按路由表匹配（instant 原有路径）。
+// （sustained 原始事件仅落库、生命周期通知走指定通道），否则按路由表匹配（instant 原有路径）。
 type dispatchItem struct {
 	evt   Event
 	route *routeDirect
@@ -242,7 +244,6 @@ type dedupState struct {
 func NewDispatcher(store *store.Store, st config.Settings, logger *slog.Logger) (*Dispatcher, error) {
 	d := &Dispatcher{
 		store:        store,
-		client:       &http.Client{Timeout: time.Duration(st.WebhookTimeoutSeconds) * time.Second},
 		queue:        make(chan dispatchItem, st.QueueSize),
 		log:          logger.With("component", "dispatch"),
 		dedupTTL:     time.Duration(st.DedupSeconds) * time.Second,
@@ -252,6 +253,7 @@ func NewDispatcher(store *store.Store, st config.Settings, logger *slog.Logger) 
 		smStop:       make(chan struct{}),
 		smNow:        time.Now,
 	}
+	d.webhookClient.Store(newWebhookClient(st.WebhookTimeoutSeconds))
 	d.routes.Store(EmptyRouteTable())
 	if err := d.configure(st, false); err != nil {
 		return nil, err
@@ -271,11 +273,21 @@ func (d *Dispatcher) Configure(st config.Settings) error {
 	return d.configure(st, true)
 }
 
+// newWebhookClient 构造带推送超时的 HTTP 客户端。
+func newWebhookClient(timeoutSeconds int) *http.Client {
+	return &http.Client{Timeout: time.Duration(timeoutSeconds) * time.Second}
+}
+
 func (d *Dispatcher) configure(st config.Settings, reopen bool) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.dedupTTL = time.Duration(st.DedupSeconds) * time.Second
 	d.maxEventLogs = st.MaxEventLogs
+	// 热更新推送超时：整体替换 HTTP 客户端（WebhookTimeoutSeconds 立即生效）。
+	t := time.Duration(st.WebhookTimeoutSeconds) * time.Second
+	if old := d.webhookClient.Load(); old == nil || old.Timeout != t {
+		d.webhookClient.Store(newWebhookClient(st.WebhookTimeoutSeconds))
+	}
 	if d.logFilePath == st.EventLogFile && d.logFile != nil {
 		return nil
 	}
@@ -518,7 +530,7 @@ func (d *Dispatcher) postWebhook(evt Event, ch store.WebhookChannel) bool {
 		req.Header.Set(k, v)
 	}
 
-	resp, err := d.client.Do(req)
+	resp, err := d.webhookClient.Load().Do(req)
 	if err != nil {
 		d.log.Error("webhook 推送失败", "channel", ch.Name, "device", evt.Device,
 			"topic", evt.Topic, "err", err)

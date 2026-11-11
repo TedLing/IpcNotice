@@ -19,19 +19,19 @@ import (
 
 // RuntimeInfo 是运行态总览，供前端「概览 / 运行态」页面展示。
 type RuntimeInfo struct {
-	StartedAt     string                  `json:"started_at"`
-	AdvertiseHost string                  `json:"advertise_host"`
-	NotifyListen  string                  `json:"notify_listen"`
-	NotifyPath    string                  `json:"notify_path"`
-	ConsumerBase  string                  `json:"consumer_base"`
-	EventMode     string                  `json:"event_mode"`
-	NotifyRunning bool                    `json:"notify_running"`
-	NotifyPosts   map[string]string       `json:"notify_posts"`
+	StartedAt     string                   `json:"started_at"`
+	AdvertiseHost string                   `json:"advertise_host"`
+	NotifyListen  string                   `json:"notify_listen"`
+	NotifyPath    string                   `json:"notify_path"`
+	ConsumerBase  string                   `json:"consumer_base"`
+	EventMode     string                   `json:"event_mode"`
+	NotifyRunning bool                     `json:"notify_running"`
+	NotifyPosts   map[string]string        `json:"notify_posts"`
 	Workers       []onvifcore.WorkerStatus `json:"workers"`
-	ActiveRoutes  int                     `json:"active_routes"`
-	Subscriptions int64                   `json:"subscriptions"`
-	LastReload    string                  `json:"last_reload"`
-	LastReloadErr string                  `json:"last_reload_err"`
+	ActiveRoutes  int                      `json:"active_routes"`
+	Subscriptions int64                    `json:"subscriptions"`
+	LastReload    string                   `json:"last_reload"`
+	LastReloadErr string                   `json:"last_reload_err"`
 }
 
 // Manager 管理全部设备的订阅生命周期、Notify 接收端与事件分发器。
@@ -48,7 +48,7 @@ type Manager struct {
 	lastReload    string
 	lastReloadErr string
 
-	reloadMu sync.Mutex
+	reloadMu  sync.Mutex
 	mu        sync.RWMutex
 	st        config.Settings
 	workers   map[int64]*onvifcore.CameraWorker
@@ -57,10 +57,10 @@ type Manager struct {
 
 // ---- WorkerHost 实现（CameraWorker 通过本接口反向访问运行态） ----
 
-func (m *Manager) Context() context.Context          { return m.ctx }
-func (m *Manager) Logger() *slog.Logger             { return m.log }
-func (m *Manager) Store() *store.Store              { return m.store }
-func (m *Manager) Settings() config.Settings        { return m.settings() }
+func (m *Manager) Context() context.Context                    { return m.ctx }
+func (m *Manager) Logger() *slog.Logger                        { return m.log }
+func (m *Manager) Store() *store.Store                         { return m.store }
+func (m *Manager) Settings() config.Settings                   { return m.settings() }
 func (m *Manager) ConsumerURL(dev *config.DeviceConfig) string { return m.notify.ConsumerURL(dev) }
 func (m *Manager) Submit(dev *config.DeviceConfig, transport string, msgs []onvif.NotificationMessage) {
 	m.dispatcher.Submit(dev, transport, msgs)
@@ -257,7 +257,13 @@ func (m *Manager) Reload() error {
 	m.cameraIDs = idsByName
 	m.lastReload = time.Now().UTC().Format(time.RFC3339)
 	m.lastReloadErr = ""
-	workers := m.workers
+	// 复制 workers 映射快照：后续的增删都在副本上进行，最后整体替换。
+	// 若直接持有引用在锁外 delete/写入，会与 Status()/deviceHealthy() 的
+	// RLock 读遍历产生 fatal error: concurrent map iteration and map write。
+	workers := make(map[int64]*onvifcore.CameraWorker, len(m.workers))
+	for id, w := range m.workers {
+		workers[id] = w
+	}
 	m.mu.Unlock()
 
 	_ = m.dispatcher.Configure(st)
@@ -324,9 +330,11 @@ func (m *Manager) setReloadErr(err error) {
 	m.mu.Unlock()
 }
 
-// deviceHealthy 返回设备的事件接收链路是否健康（worker 存在且已连接）。
-// 持续事件的静默超时据此决定是否允许把活动判定为结束：
-// 设备断网、订阅失效或 Worker 异常时返回 false，不产生结束通知。
+// deviceHealthy 返回设备的事件接收链路是否健康（worker 存在、订阅已连接、
+// 且设备健康探测未判定离线）。持续事件的静默超时据此决定是否允许把活动判定为结束：
+// 设备断电/断网、订阅失效或 Worker 异常时返回 false，不产生结束通知。
+// 注意：探测为 30s 一次、连续 3 次失败才判离线，断电后最长约 90s 才确认，
+// 确认前的窗口内仍可能依赖续约/PullPoint 失败兜底；该延迟为已知可接受的设计。
 func (m *Manager) deviceHealthy(device string) bool {
 	m.mu.RLock()
 	id, ok := m.cameraIDs[device]
@@ -335,7 +343,8 @@ func (m *Manager) deviceHealthy(device string) bool {
 	if !ok || w == nil {
 		return false
 	}
-	return w.Status().Connected
+	status := w.Status()
+	return status.Connected && status.DeviceOnline
 }
 
 // Status 返回运行态总览快照。

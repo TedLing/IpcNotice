@@ -102,15 +102,19 @@ onMounted(load);
         <el-divider content-position="left">事件外发与存储</el-divider>
         <el-form-item label="Webhook 超时（秒）">
           <el-input-number v-model="form.webhook_timeout_seconds" :min="1" :max="120" />
+          <div class="text-xs text-gray-400">保存后立即生效（热更新）。</div>
         </el-form-item>
         <el-form-item label="分发 worker 数">
           <el-input-number v-model="form.webhook_workers" :min="1" :max="64" />
+          <div class="text-xs text-amber-500">需重启程序后生效。</div>
         </el-form-item>
         <el-form-item label="事件队列容量">
           <el-input-number v-model="form.queue_size" :min="16" :max="100000" />
+          <div class="text-xs text-amber-500">需重启程序后生效。</div>
         </el-form-item>
         <el-form-item label="读取超时（秒）">
           <el-input-number v-model="form.read_timeout_seconds" :min="1" :max="120" />
+          <div class="text-xs text-amber-500">需重启程序后生效。</div>
         </el-form-item>
         <el-form-item label="事件 JSONL 文件">
           <el-input v-model="form.event_log_file" placeholder="logs/events.jsonl" />

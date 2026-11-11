@@ -3,7 +3,6 @@ package dispatch
 import (
 	"io"
 	"log/slog"
-	"net/http"
 	"sync"
 	"testing"
 	"time"
@@ -16,7 +15,6 @@ import (
 
 func newSustainedDispatcher() *Dispatcher {
 	d := &Dispatcher{
-		client:   &http.Client{Timeout: time.Second},
 		queue:    make(chan dispatchItem, 4096),
 		log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
 		seen:     make(map[string]dedupState),
@@ -24,6 +22,7 @@ func newSustainedDispatcher() *Dispatcher {
 		smStop:   make(chan struct{}),
 		smNow:    time.Now,
 	}
+	d.webhookClient.Store(newWebhookClient(1))
 	d.routes.Store(EmptyRouteTable())
 	return d
 }

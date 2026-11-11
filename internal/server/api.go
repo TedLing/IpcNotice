@@ -41,7 +41,7 @@ type APIServer struct {
 	store      *store.Store
 	mgr        *manager.Manager
 	log        *slog.Logger
-	distFS     fs.FS // 前端资源：默认内嵌（embed），可用 -web-dir 覆盖为磁盘目录
+	distFS     fs.FS  // 前端资源：默认内嵌（embed），可用 -web-dir 覆盖为磁盘目录
 	distSource string // 日志用：embedded / dir:xxx
 	version    string
 	mux        *http.ServeMux
@@ -618,7 +618,7 @@ func (s *APIServer) saveSubscriptions(w http.ResponseWriter, r *http.Request) {
 	}
 	var body struct {
 		Items   []store.SubscriptionInput `json:"items"`
-		Remarks []store.TopicRemarkInput   `json:"remarks"`
+		Remarks []store.TopicRemarkInput  `json:"remarks"`
 	}
 	if err := readJSON(r, &body); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())

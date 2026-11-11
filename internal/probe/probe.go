@@ -217,7 +217,7 @@ func fetchTopicPaths(ctx context.Context, cli *onvif.Client) ([]string, error) {
 var descriptionElements = map[string]bool{
 	"MessageDescription":           true,
 	"MessageDescriptionExtension":  true,
-	"SimpleItemDescription":         true,
+	"SimpleItemDescription":        true,
 	"ElementItemDescription":       true,
 	"Source":                       true,
 	"Key":                          true,
@@ -289,14 +289,14 @@ type DeviceInfoRow struct {
 // 展示形态三选一：Rows（键值对）、Columns+Records（多条目表格）、Text（长文本）。
 type DeviceInfoItem struct {
 	Operation string          `json:"operation"`
-	Label      string         `json:"label"`
-	OK         bool           `json:"ok"`
-	Error      string         `json:"error,omitempty"`
-	Rows       []DeviceInfoRow `json:"rows,omitempty"`
-	Columns    []string       `json:"columns,omitempty"`
-	Records    [][]string     `json:"records,omitempty"`
-	Text       string         `json:"text,omitempty"`
-	Truncated  bool           `json:"truncated,omitempty"`
+	Label     string          `json:"label"`
+	OK        bool            `json:"ok"`
+	Error     string          `json:"error,omitempty"`
+	Rows      []DeviceInfoRow `json:"rows,omitempty"`
+	Columns   []string        `json:"columns,omitempty"`
+	Records   [][]string      `json:"records,omitempty"`
+	Text      string          `json:"text,omitempty"`
+	Truncated bool            `json:"truncated,omitempty"`
 }
 
 type DeviceInfoSection struct {

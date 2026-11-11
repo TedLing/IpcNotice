@@ -178,7 +178,7 @@ func TestEventCapabilityRows(t *testing.T) {
 		MaxPullPoints:               8,
 		WSSubscriptionPolicySupport: true,
 		EventBrokerProtocols:        []string{"mqtt", "amqp"},
-		MetadataOverMQTT:             true,
+		MetadataOverMQTT:            true,
 	})
 	got := map[string]string{}
 	for _, r := range rows {

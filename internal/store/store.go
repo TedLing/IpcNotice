@@ -103,39 +103,39 @@ type Subscription struct {
 	// InactivityTimeout 是 sustained 模式的静默超时秒数（<=0 时按 30 处理）。
 	InactivityTimeout int `json:"inactivity_timeout"`
 	// NotifyStart / NotifyEnd 控制 sustained 模式是否推送开始/结束通知。
-	NotifyStart bool `json:"notify_start"`
-	NotifyEnd   bool `json:"notify_end"`
+	NotifyStart bool   `json:"notify_start"`
+	NotifyEnd   bool   `json:"notify_end"`
 	CreatedAt   string `json:"created_at"`
 	UpdatedAt   string `json:"updated_at"`
 }
 
 // SubscriptionInput 是前端批量保存订阅的入参。
 type SubscriptionInput struct {
-	Topic             string   `json:"topic"`
-	Enabled           bool     `json:"enabled"`
-	ChannelIDs        []int64  `json:"channel_ids"`
-	EventMode         string   `json:"event_mode"`
-	InactivityTimeout int      `json:"inactivity_timeout"`
-	NotifyStart       bool     `json:"notify_start"`
-	NotifyEnd         bool     `json:"notify_end"`
+	Topic             string  `json:"topic"`
+	Enabled           bool    `json:"enabled"`
+	ChannelIDs        []int64 `json:"channel_ids"`
+	EventMode         string  `json:"event_mode"`
+	InactivityTimeout int     `json:"inactivity_timeout"`
+	NotifyStart       bool    `json:"notify_start"`
+	NotifyEnd         bool    `json:"notify_end"`
 }
 
 // EventState 是 sustained 模式下某条持续事件实例的落库状态快照。
 // 状态转换时写入；服务重启后内存状态全部视为 IDLE（未知），等待新事件重新确认，
 // 不会依据停机期间的静默伪造结束通知。
 type EventState struct {
-	StateKey    string `json:"state_key"`
-	CameraID    int64  `json:"camera_id"`
-	Device      string `json:"device"`
-	Topic       string `json:"topic"`
-	Source      string `json:"source"`
-	Phase       string `json:"phase"` // active | idle
-	StartedAt   string `json:"started_at"`
-	LastSeenAt  string `json:"last_seen_at"`
-	EndedAt     string `json:"ended_at"`
-	EndReason   string `json:"end_reason"` // EXPLICIT_STOP | INACTIVITY_TIMEOUT | ""
-	EventCount  int    `json:"event_count"`
-	UpdatedAt   string `json:"updated_at"`
+	StateKey   string `json:"state_key"`
+	CameraID   int64  `json:"camera_id"`
+	Device     string `json:"device"`
+	Topic      string `json:"topic"`
+	Source     string `json:"source"`
+	Phase      string `json:"phase"` // active | idle
+	StartedAt  string `json:"started_at"`
+	LastSeenAt string `json:"last_seen_at"`
+	EndedAt    string `json:"ended_at"`
+	EndReason  string `json:"end_reason"` // EXPLICIT_STOP | INACTIVITY_TIMEOUT | ""
+	EventCount int    `json:"event_count"`
+	UpdatedAt  string `json:"updated_at"`
 }
 
 // EventLog 是事件落库记录。

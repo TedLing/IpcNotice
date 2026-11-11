@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
-	"net/http"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -109,12 +108,12 @@ func newTestDispatcher(dedupSeconds int) *Dispatcher {
 	st.QueueSize = 8
 	st.WebhookWorkers = 1
 	d := &Dispatcher{
-		client:   &http.Client{Timeout: time.Second},
 		queue:    make(chan dispatchItem, st.QueueSize),
 		log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
 		dedupTTL: time.Duration(dedupSeconds) * time.Second,
 		seen:     make(map[string]dedupState),
 	}
+	d.webhookClient.Store(newWebhookClient(1))
 	d.routes.Store(EmptyRouteTable())
 	return d
 }

@@ -636,7 +636,7 @@ func (s *APIServer) saveSubscriptions(w http.ResponseWriter, r *http.Request) {
 	for _, it := range body.Items {
 		mode := strings.ToLower(strings.TrimSpace(it.EventMode))
 		if mode == "" {
-			mode = "instant"
+			mode = "sustained"
 		}
 		if mode != "instant" && mode != "sustained" {
 			writeErr(w, http.StatusBadRequest,

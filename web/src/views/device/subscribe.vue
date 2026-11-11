@@ -21,7 +21,7 @@ interface TopicRow {
   selected: boolean;
   enabled: boolean;
   channelIds: number[];
-  /** 事件生命周期模式：instant（默认）| sustained（持续事件状态管理） */
+  /** 事件生命周期模式：sustained（默认，持续事件状态管理）| instant（冷却去重） */
   eventMode: "instant" | "sustained";
   /** sustained 静默超时秒数（0 = 默认 30） */
   inactivityTimeout: number;
@@ -204,7 +204,7 @@ function merge(topics: CameraTopic[], subs: Subscription[]): TopicRow[] {
       selected: false,
       enabled: true,
       channelIds: [],
-      eventMode: "instant",
+      eventMode: "sustained",
       inactivityTimeout: 30,
       notifyStart: true,
       notifyEnd: true

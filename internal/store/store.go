@@ -88,7 +88,7 @@ type TopicRemarkInput struct {
 }
 
 // Subscription 是「某台摄像头的某个事件主题」的订阅，含通知渠道。
-// EventMode 是事件生命周期模式：instant（默认，保持冷却去重行为）或
+// EventMode 是事件生命周期模式：sustained（默认，持续事件状态管理）或
 // sustained（持续事件状态管理：开始/结束通知，活动期间不重复推送）。
 // 注意与全局 settings 的 event_mode（auto/push/pull，传输方式）无关。
 type Subscription struct {
@@ -244,7 +244,7 @@ CREATE TABLE IF NOT EXISTS event_subscriptions (
   camera_id INTEGER NOT NULL REFERENCES cameras(id) ON DELETE CASCADE,
   topic TEXT NOT NULL,
   enabled INTEGER NOT NULL DEFAULT 1,
-  event_mode TEXT NOT NULL DEFAULT 'instant',
+  event_mode TEXT NOT NULL DEFAULT 'sustained',
   inactivity_timeout INTEGER NOT NULL DEFAULT 30,
   notify_start INTEGER NOT NULL DEFAULT 1,
   notify_end INTEGER NOT NULL DEFAULT 1,
@@ -451,7 +451,7 @@ func (s *Store) ensureColumn(table, column, ddl string) error {
 // ensureSubscriptionModeColumns 幂等地为旧数据库补上订阅的持续事件模式字段。
 func (s *Store) ensureSubscriptionModeColumns() error {
 	if err := s.ensureColumn("event_subscriptions", "event_mode",
-		`ALTER TABLE event_subscriptions ADD COLUMN event_mode TEXT NOT NULL DEFAULT 'instant'`); err != nil {
+		`ALTER TABLE event_subscriptions ADD COLUMN event_mode TEXT NOT NULL DEFAULT 'sustained'`); err != nil {
 		return err
 	}
 	if err := s.ensureColumn("event_subscriptions", "inactivity_timeout",
@@ -963,7 +963,7 @@ func (s *Store) ListSubscriptions(cameraID int64) ([]Subscription, error) {
 		}
 		sub.Enabled = enabled != 0
 		if sub.EventMode == "" {
-			sub.EventMode = "instant"
+			sub.EventMode = "sustained"
 		}
 		sub.NotifyStart = notifyStart != 0
 		sub.NotifyEnd = notifyEnd != 0
@@ -1025,10 +1025,10 @@ func (s *Store) ReplaceSubscriptions(cameraID int64, items []SubscriptionInput) 
 		}
 		mode := strings.ToLower(strings.TrimSpace(item.EventMode))
 		if mode == "" {
-			mode = "instant"
+			mode = "sustained"
 		}
 		if mode != "instant" && mode != "sustained" {
-			mode = "instant"
+			mode = "sustained"
 		}
 		res, err := tx.Exec(`INSERT INTO event_subscriptions(camera_id,topic,enabled,
 			event_mode,inactivity_timeout,notify_start,notify_end,created_at,updated_at)

@@ -10,7 +10,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
+	"mime"
 	"net"
 	"net/http"
 	"net/url"
@@ -28,13 +30,14 @@ const sessionTTL = 24 * time.Hour
 
 // APIServer 提供管理界面所需的 REST API 与前端静态资源。
 type APIServer struct {
-	cfg    *Config
-	store  *Store
-	mgr    *Manager
-	log    *slog.Logger
-	dist   string
-	mux    *http.ServeMux
-	server *http.Server
+	cfg        *Config
+	store      *Store
+	mgr        *Manager
+	log        *slog.Logger
+	distFS     fs.FS // 前端资源：默认内嵌（embed），可用 -web-dir 覆盖为磁盘目录
+	distSource string // 日志用：embedded / dir:xxx
+	mux        *http.ServeMux
+	server     *http.Server
 
 	preview *previewHub // WebRTC 预览会话（RTSP → WebRTC 中继）
 
@@ -42,13 +45,14 @@ type APIServer struct {
 	sessions map[string]time.Time
 }
 
-func NewAPIServer(cfg *Config, store *Store, mgr *Manager, dist string, logger *slog.Logger) *APIServer {
+func NewAPIServer(cfg *Config, store *Store, mgr *Manager, webDir string, logger *slog.Logger) *APIServer {
 	s := &APIServer{
-		cfg: cfg, store: store, mgr: mgr, dist: dist,
+		cfg: cfg, store: store, mgr: mgr,
 		log: logger.With("component", "api"),
 		mux: http.NewServeMux(), sessions: map[string]time.Time{},
 		preview: newPreviewHub(logger),
 	}
+	s.distFS, s.distSource = resolveWebFS(webDir)
 	s.routes()
 	s.server = &http.Server{
 		Addr:              cfg.Addr(),
@@ -108,7 +112,7 @@ func (s *APIServer) Start() error {
 		return fmt.Errorf("管理界面监听 %s 失败: %w", s.cfg.Addr(), err)
 	}
 	s.log.Info("管理界面已启动", "url", "http://127.0.0.1:"+strconv.Itoa(s.cfg.Port),
-		"dist", s.dist)
+		"dist", s.distSource)
 	go func() {
 		if err := s.server.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			s.log.Error("管理界面异常退出", "err", err)
@@ -754,28 +758,107 @@ func (s *APIServer) reloadQuiet() {
 
 // ---------------- static ----------------
 
+// resolveWebFS 选择前端资源来源：若显式指定 -web-dir 且目录存在，则使用磁盘目录；
+// 否则使用编译期内嵌的 web/dist（单文件部署）。
+func resolveWebFS(webDir string) (fsys fs.FS, source string) {
+	if webDir != "" {
+		if info, err := os.Stat(webDir); err == nil && info.IsDir() {
+			return os.DirFS(webDir), "dir:" + webDir
+		}
+		slog.Warn("指定的 -web-dir 不存在，回退到内嵌前端", "webDir", webDir)
+	}
+	sub, err := fs.Sub(webFS, "web/dist")
+	if err != nil {
+		return nil, "embed-failed:" + err.Error()
+	}
+	return sub, "embedded"
+}
+
 func (s *APIServer) serveStatic(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	indexPath := filepath.Join(s.dist, "index.html")
-	if _, err := os.Stat(indexPath); err != nil {
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = io.WriteString(w, `<!doctype html><meta charset="utf-8"><h2>前端尚未构建</h2>
-<p>请在 <code>web/</code> 目录执行 <code>pnpm install &amp;&amp; pnpm build</code>，然后重启本程序。</p>
+	if s.distFS == nil {
+		s.serveNotBuilt(w)
+		return
+	}
+	rel := strings.TrimPrefix(path.Clean("/"+r.URL.Path), "/")
+	if rel == "" || rel == "." {
+		rel = "index.html"
+	}
+	// 优先尝试直接打开请求的资源
+	if f, err := s.distFS.Open(rel); err == nil {
+		if stat, serr := f.Stat(); serr == nil && !stat.IsDir() {
+			defer f.Close()
+			s.serveFSFile(w, r, rel, f, stat)
+			return
+		}
+		f.Close()
+	}
+	// SPA 回退：未知路径统一返回 index.html
+	if idx, ierr := s.distFS.Open("index.html"); ierr == nil {
+		if stat, serr := idx.Stat(); serr == nil {
+			defer idx.Close()
+			s.serveFSFile(w, r, "index.html", idx, stat)
+			return
+		}
+		idx.Close()
+	}
+	s.serveNotBuilt(w)
+}
+
+// serveFSFile 以正确的 Content-Type 与范围请求支持，流式输出 fs.File。
+func (s *APIServer) serveFSFile(w http.ResponseWriter, r *http.Request, name string, f fs.File, stat fs.FileInfo) {
+	if ct := contentType(name); ct != "" {
+		w.Header().Set("Content-Type", ct)
+	}
+	http.ServeContent(w, r, stat.Name(), stat.ModTime(), f.(io.ReadSeeker))
+}
+
+func (s *APIServer) serveNotBuilt(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusServiceUnavailable)
+	_, _ = io.WriteString(w, `<!doctype html><meta charset="utf-8"><h2>前端尚未构建</h2>
+<p>请先在 <code>web/</code> 目录执行 <code>pnpm install &amp;&amp; pnpm build</code> 构建前端，然后重新编译并运行本程序（前端已内嵌到二进制中）。</p>
 <p>开发模式可直接在 <code>web/</code> 执行 <code>pnpm dev</code>，已配置 /api 代理。</p>`)
-		return
+}
+
+// contentType 按扩展名返回合适的 Content-Type；优先内置映射（跨平台更可靠），
+// 未知扩展名回退到标准 mime 库。
+func contentType(name string) string {
+	switch ext := strings.ToLower(filepath.Ext(name)); ext {
+	case ".html", ".htm":
+		return "text/html; charset=utf-8"
+	case ".js", ".mjs", ".cjs":
+		return "application/javascript; charset=utf-8"
+	case ".css":
+		return "text/css; charset=utf-8"
+	case ".json":
+		return "application/json; charset=utf-8"
+	case ".svg":
+		return "image/svg+xml"
+	case ".png":
+		return "image/png"
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".gif":
+		return "image/gif"
+	case ".ico":
+		return "image/x-icon"
+	case ".woff2":
+		return "font/woff2"
+	case ".woff":
+		return "font/woff"
+	case ".ttf", ".otf":
+		return "font/opentype"
+	case ".webp":
+		return "image/webp"
+	case ".map":
+		return "application/json; charset=utf-8"
+	default:
+		return mime.TypeByExtension(ext)
 	}
-	clean := path.Clean("/" + r.URL.Path)
-	rel := strings.TrimPrefix(clean, "/")
-	target := filepath.Join(s.dist, filepath.FromSlash(rel))
-	if info, err := os.Stat(target); err == nil && !info.IsDir() {
-		http.ServeFile(w, r, target)
-		return
-	}
-	http.ServeFile(w, r, indexPath) // SPA 回退
 }
 
 // ---------------- helpers ----------------

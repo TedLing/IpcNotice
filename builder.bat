@@ -35,7 +35,7 @@ go build -o ipcnotice-linux-arm64 .
 if errorlevel 1 goto :fail
 
 echo.
-echo Done. Binaries + web/dist are up to date:
+echo Done. 前端已内嵌进二进制（单文件部署，无需 web/dist）：
 echo   ipcnotice.exe            (windows/amd64)
 echo   ipcnotice-linux-amd64    (linux/amd64)
 echo   ipcnotice-linux-arm64    (linux/arm64)

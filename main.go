@@ -27,7 +27,7 @@ func run() error {
 	var (
 		configPath = flag.String("config", "config.json", "配置文件路径（仅用户名/密码/端口）")
 		dbPath     = flag.String("db", databaseFile, "SQLite 数据库文件路径")
-		webDir     = flag.String("web-dir", "web/dist", "前端构建产物目录")
+		webDir     = flag.String("web-dir", "", "前端构建产物目录（留空则使用编译期内嵌的前端，单文件部署）")
 		logFile    = flag.String("log-file", "", "额外写入日志文件（追加）")
 		port       = flag.Int("port", 0, "覆盖配置文件中的管理界面端口")
 		debug      = flag.Bool("debug", false, "输出 DEBUG 级日志")

@@ -88,7 +88,7 @@ flowchart LR
 
 ### Release 压缩包
 
-在 [Releases](../../releases) 下载对应平台的压缩包，解压后**保持目录结构**（`web/dist` 必须与可执行文件同级），直接运行：
+在 [Releases](../../releases) 下载对应平台的压缩包，解压后**直接运行即可**（前端已内嵌于二进制，无需任何额外目录）：
 
 ```bash
 # Linux / macOS
@@ -102,18 +102,20 @@ ipcnotice.exe
 
 ### 从源码构建
 
+> 前端构建产物在 `go build` 时通过 `embed` 打包进二进制，因此**必须先把前端构建出来，再编译后端**。
+
 ```bash
-# 后端
+# 1) 前端（必须先构建，否则 go build 会因 web/dist 不存在而失败）
+cd web
+pnpm install
+pnpm build                       # 生成 web/dist（随后被内嵌进二进制）
+cd ..
+
+# 2) 后端（自动内嵌上一步的 web/dist）
 go mod download
 go build -o ipcnotice .          # Windows 下可用 -o ipcnotice.exe
 
-# 前端（产物必须存在，否则界面会提示「前端尚未构建」）
-cd web
-pnpm install
-pnpm build                       # 生成 web/dist
-cd ..
-
-# 启动
+# 3) 启动
 ./ipcnotice                      # 默认端口 8080
 ```
 
@@ -136,7 +138,7 @@ cd ..
 |---|---|---|
 | `-config` | `config.json` | 配置文件路径 |
 | `-db` | `data/ipcnotice.db` | SQLite 文件 |
-| `-web-dir` | `web/dist` | 前端静态资源目录 |
+| `-web-dir` | `""`（空，使用内嵌前端） | 前端静态资源目录；留空则使用编译期内嵌的前端（单文件部署），指定磁盘目录可覆盖 |
 | `-port` | `0`（不覆盖） | 覆盖配置文件中的端口 |
 | `-log-file` | 空（仅 stdout） | 额外写日志文件 |
 | `-debug` | `false` | DEBUG 级日志 |
@@ -234,7 +236,9 @@ curl -b cookie.txt http://127.0.0.1:8080/api/runtime
 - **推标签自动发版**：`git tag v0.2.0 && git push origin v0.2.0`
 - **手动运行**：GitHub → Actions → `Build & Release` → Run workflow，填写版本号（例如 `v0.2.0`）与是否预发布。
 
-流程：构建一次 `web/dist` → `go vet` / `go test` → `CGO_ENABLED=0` 交叉编译 5 个目标（Windows amd64、Linux amd64/arm64、macOS amd64/arm64）→ 每包内含可执行文件、`web/dist`、`README.md`、`config.example.json` 与 `VERSION` → 生成 `SHA256SUMS.txt` 并创建 GitHub Release。版本号通过 `-ldflags "-X main.version=<tag>"` 注入。
+流程：先构建一次前端 `web/dist`（由 vite 输出到仓库内）→ `go vet` / `go test`（此时已内嵌前端）→ `CGO_ENABLED=0` 交叉编译 3 个目标（Windows amd64、Linux amd64/arm64）→ 每包内含**已内嵌前端的可执行文件**、`README.md`、`config.example.json` 与 `VERSION` → 生成 `SHA256SUMS.txt` 并创建 GitHub Release。版本号通过 `-ldflags "-X main.version=<tag>"` 注入。
+
+> 因为前端在编译期已 `embed` 进二进制，Release 包不再包含 `web/dist` 目录，解压即为单文件部署。
 
 > 打包时只会复制上述公开文件；`config.json`、数据库、日志与本地协作文档已在 `.gitignore` 中排除，不会进入仓库或 Release。
 
@@ -295,7 +299,7 @@ go build -o ipcnotice .
 # 前端
 cd web
 pnpm typecheck
-pnpm build          # 改前端后必做，生产界面读取 web/dist
+pnpm build          # 改前端后必做；go build 前必须先构建，否则 embed 失败
 ```
 
 目录速览：
@@ -315,7 +319,7 @@ IpcNotice/
     ├── src/views/         # 业务页面
     ├── src/router/        # 菜单与路由
     ├── public/            # 站点图标与全局配置
-    └── dist/              # 前端构建产物，由 Go 同源托管
+    └── dist/              # 前端构建产物，编译期由 Go 通过 embed 内嵌进二进制
 ```
 
 主要模块：`main.go` 启动与优雅退出、`config.go` 配置模型、`store.go` 数据库、`runtime.go` 热重载、`listen.go` 订阅生命周期、`notify.go` 回调接收、`dispatch.go` 去重与推送、`probe.go` 设备探测、`preview.go` WebRTC 预览中继、`api.go` REST 接口、`transport.go` SOAP 响应修正。

@@ -118,9 +118,8 @@ jobs:
         run: |
           set -euo pipefail
           NAME="ipcnotice-${RELEASE_TAG}-${TARGET}"
-          mkdir -p "package/${NAME}/web" out
+          mkdir -p "package/${NAME}" out
           cp "build/ipcnotice${EXT}" "package/${NAME}/"
-          cp -R web/dist "package/${NAME}/web/dist"
           cp README.md config.example.json "package/${NAME}/"
           printf '%s\n' "${RELEASE_TAG}" > "package/${NAME}/VERSION"
           if [ "${ARCHIVE}" = "zip" ]; then
@@ -173,7 +172,7 @@ jobs:
           body: |
             ### 下载说明
 
-            解压后保持目录结构（`web/dist` 必须与可执行文件同级），然后运行：
+            前端已内嵌于二进制中，**解压后直接运行即可**（无需额外目录）：
 
             - Windows：`ipcnotice.exe`
             - Linux：`chmod +x ipcnotice && ./ipcnotice`

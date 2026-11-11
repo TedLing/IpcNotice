@@ -105,6 +105,12 @@ export interface Subscription {
   topic: string;
   enabled: boolean;
   channel_ids: number[];
+  /** 事件生命周期模式：instant（默认，冷却去重）| sustained（持续事件状态管理） */
+  event_mode: string;
+  /** sustained 静默超时秒数（0 = 默认 30 秒） */
+  inactivity_timeout: number;
+  notify_start: boolean;
+  notify_end: boolean;
   created_at: string;
   updated_at: string;
 }

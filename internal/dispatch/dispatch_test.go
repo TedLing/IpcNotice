@@ -109,7 +109,7 @@ func newTestDispatcher(dedupSeconds int) *Dispatcher {
 	st.WebhookWorkers = 1
 	d := &Dispatcher{
 		client:   &http.Client{Timeout: time.Second},
-		queue:    make(chan Event, st.QueueSize),
+		queue:    make(chan dispatchItem, st.QueueSize),
 		log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
 		dedupTTL: time.Duration(dedupSeconds) * time.Second,
 		seen:     make(map[string]dedupState),

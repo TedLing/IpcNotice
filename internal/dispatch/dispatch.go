@@ -44,6 +44,19 @@ type Event struct {
 	Source     map[string]string `json:"source,omitempty"`
 	Key        map[string]string `json:"key,omitempty"`
 	Data       map[string]string `json:"data,omitempty"`
+
+	// ---- sustained 模式的生命周期字段（instant 模式事件这些字段为空）----
+	// EventPhase: started | ended。state_key 标识事件实例；
+	// started_at/last_seen_at/ended_at 为 RFC3339；duration_seconds 是活动持续秒数；
+	// event_count 是本轮活动期间收到的事件总数；end_reason: EXPLICIT_STOP | INACTIVITY_TIMEOUT。
+	EventPhase      string `json:"event_phase,omitempty"`
+	StateKey        string `json:"state_key,omitempty"`
+	StartedAt       string `json:"started_at,omitempty"`
+	LastSeenAt      string `json:"last_seen_at,omitempty"`
+	EndedAt         string `json:"ended_at,omitempty"`
+	DurationSeconds int64  `json:"duration_seconds,omitempty"`
+	EventCount      int    `json:"event_count,omitempty"`
+	EndReason       string `json:"end_reason,omitempty"`
 }
 
 // MotionPayload 是移动侦测结构化数据（如带置信度）。
@@ -91,9 +104,15 @@ func itemsToMap(items []types.SimpleItem) map[string]string {
 }
 
 // Route 是「某主题 → 若干通知渠道」的一条路由。
+// Mode: instant（默认，冷却去重）/ sustained（持续事件状态管理）；
+// Timeout/NotifyStart/NotifyEnd 仅在 sustained 模式生效。
 type Route struct {
-	Topic    string
-	Channels []store.WebhookChannel
+	Topic             string
+	Channels          []store.WebhookChannel
+	Mode              string
+	InactivityTimeout int
+	NotifyStart       bool
+	NotifyEnd         bool
 }
 
 // RouteTable 是运行期由数据库订阅配置生成的一份只读快照。
@@ -174,7 +193,7 @@ func (rt *RouteTable) match(device, topic string) (bool, []store.WebhookChannel,
 type Dispatcher struct {
 	store  *store.Store
 	client *http.Client
-	queue  chan Event
+	queue  chan dispatchItem
 	wg     sync.WaitGroup
 	log    *slog.Logger
 
@@ -188,6 +207,27 @@ type Dispatcher struct {
 
 	seenMu sync.Mutex
 	seen   map[string]dedupState
+
+	// ---- sustained 持续事件状态管理（见 state.go）----
+	smStates     map[string]*eventState
+	smMu         sync.Mutex
+	smStop       chan struct{}
+	smNow        func() time.Time // 可注入时钟（测试用）
+	deviceHealth func(device string) bool // nil 时视为全部健康
+}
+
+// dispatchItem 是分发队列的一条记录。route 非 nil 时使用显式路由
+//（sustained 原始事件仅落库、生命周期通知走指定通道），否则按路由表匹配（instant 原有路径）。
+type dispatchItem struct {
+	evt   Event
+	route *routeDirect
+}
+
+type routeDirect struct {
+	channels []store.WebhookChannel
+	names    string
+	matched  bool
+	push     bool // false = 仅落库/日志，不推 webhook
 }
 
 // dedupState 记录某条「设备+主题+操作+来源」的冷却截止时间。
@@ -203,11 +243,14 @@ func NewDispatcher(store *store.Store, st config.Settings, logger *slog.Logger) 
 	d := &Dispatcher{
 		store:        store,
 		client:       &http.Client{Timeout: time.Duration(st.WebhookTimeoutSeconds) * time.Second},
-		queue:        make(chan Event, st.QueueSize),
+		queue:        make(chan dispatchItem, st.QueueSize),
 		log:          logger.With("component", "dispatch"),
 		dedupTTL:     time.Duration(st.DedupSeconds) * time.Second,
 		maxEventLogs: st.MaxEventLogs,
 		seen:         make(map[string]dedupState),
+		smStates:     make(map[string]*eventState),
+		smStop:       make(chan struct{}),
+		smNow:        time.Now,
 	}
 	d.routes.Store(EmptyRouteTable())
 	if err := d.configure(st, false); err != nil {
@@ -217,6 +260,9 @@ func NewDispatcher(store *store.Store, st config.Settings, logger *slog.Logger) 
 		d.wg.Add(1)
 		go d.worker(i)
 	}
+	// 统一的静默超时扫描：每秒一次检查 ACTIVE 状态，不为单个事件建定时器。
+	d.wg.Add(1)
+	go d.scanLoop()
 	return d, nil
 }
 
@@ -275,27 +321,44 @@ func (d *Dispatcher) RouteCount() int {
 	return n
 }
 
+// SetDeviceHealth 注册设备接收链路健康检查回调（Manager 提供）。
+// 返回 false 表示该设备的订阅/接收链路异常，静默超时扫描不得将其判定为结束。
+func (d *Dispatcher) SetDeviceHealth(fn func(device string) bool) {
+	d.deviceHealth = fn
+}
+
 // Submit 入队一批事件；队列满时丢弃并记录，避免拖垮订阅循环。
 func (d *Dispatcher) Submit(dev *config.DeviceConfig, transport string, msgs []onvif.NotificationMessage) {
 	for _, msg := range msgs {
 		evt := buildEvent(dev, transport, msg)
+		// sustained 订阅：绕过冷却去重；原始事件照常落库（不推 webhook）；
+		// 由状态机决定 started/ended 通知。
+		if s, ok := d.routes.Load().sustainedFor(dev.Name, evt.Topic); ok {
+			evt.ID = fmt.Sprintf("%d-%06d", time.Now().UnixNano(), eventSeq.Add(1))
+			d.processSustained(dev, evt, s)
+			continue
+		}
 		if d.isDuplicate(evt) {
 			d.log.Debug("去重：跳过重复状态", "device", dev.Name, "topic", evt.Topic,
 				"device_time", evt.DeviceTime, "data", util.JSONDump(evt.Data))
 			continue
 		}
 		evt.ID = fmt.Sprintf("%d-%06d", time.Now().UnixNano(), eventSeq.Add(1))
-		d.mu.RLock()
-		if d.closed {
-			d.mu.RUnlock()
-			return
-		}
-		select {
-		case d.queue <- evt:
-		default:
-			d.log.Warn("事件队列已满，丢弃事件", "device", dev.Name, "topic", evt.Topic)
-		}
-		d.mu.RUnlock()
+		d.enqueueItem(dispatchItem{evt: evt}, dev.Name, evt.Topic)
+	}
+}
+
+// enqueueItem 非阻塞入队；队列满时丢弃并记录。
+func (d *Dispatcher) enqueueItem(it dispatchItem, device, topic string) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	if d.closed {
+		return
+	}
+	select {
+	case d.queue <- it:
+	default:
+		d.log.Warn("事件队列已满，丢弃事件", "device", device, "topic", topic)
 	}
 }
 
@@ -331,14 +394,23 @@ func (d *Dispatcher) isDuplicate(evt Event) bool {
 
 func (d *Dispatcher) worker(_ int) {
 	defer d.wg.Done()
-	for evt := range d.queue {
-		d.handle(evt)
+	for it := range d.queue {
+		d.handle(it)
 	}
 }
 
-func (d *Dispatcher) handle(evt Event) {
+func (d *Dispatcher) handle(it dispatchItem) {
+	evt := it.evt
 	rt := d.routes.Load()
 	matched, channels, channelNames := rt.match(evt.Device, evt.Topic)
+	push := true
+	if it.route != nil {
+		// sustained 显式路由：原始事件仅落库；生命周期通知走指定通道。
+		matched = it.route.matched
+		channels = it.route.channels
+		channelNames = it.route.names
+		push = it.route.push
+	}
 	// 在写 JSONL / SQLite / webhook 之前补上标题，保证三处内容与 HTTP body 完全一致。
 	evt.Title, evt.Remark = rt.LookupTitle(evt.Device, evt.Topic)
 	cameraID := int64(0)
@@ -347,17 +419,25 @@ func (d *Dispatcher) handle(evt Event) {
 	}
 
 	// 记录运行期真实出现的主题（TP-Link 的实际主题常不在 TopicSet 声明树里）。
-	if cameraID > 0 && util.NormalizeTopic(evt.Topic) != "" {
+	if cameraID > 0 && util.NormalizeTopic(evt.Topic) != "" && d.store != nil {
 		if _, err := d.store.UpsertObservedTopic(cameraID, util.NormalizeTopic(evt.Topic)); err != nil {
 			d.log.Warn("记录观察到的事件主题失败", "err", err)
 		}
 	}
 
 	dispatched := false
-	for _, ch := range channels {
-		if d.postWebhook(evt, ch) {
-			dispatched = true
+	if push {
+		for _, ch := range channels {
+			if d.postWebhook(evt, ch) {
+				dispatched = true
+			}
 		}
+	}
+	if evt.EventPhase != "" {
+		d.log.Info("LIFECYCLE", "phase", evt.EventPhase, "state_key", evt.StateKey,
+			"device", evt.Device, "topic", evt.Topic, "title", evt.Title,
+			"event_count", evt.EventCount, "duration_seconds", evt.DurationSeconds,
+			"end_reason", evt.EndReason, "push", push)
 	}
 
 	d.log.Info("EVENT",
@@ -381,15 +461,17 @@ func (d *Dispatcher) handle(evt Event) {
 		_, _ = f.Write(line)
 		d.mu.Unlock()
 	}
-	if err := d.store.InsertEventLog(store.EventLog{
-		EventID: evt.ID, CameraID: cameraID, Device: evt.Device,
-		Topic: util.NormalizeTopic(evt.Topic), Transport: evt.Transport,
-		Payload: payload, Matched: matched, Dispatched: dispatched,
-		Channels: channelNames, CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
-	}); err != nil {
-		d.log.Warn("事件落库失败", "err", err)
-	} else if maxLogs > 0 && eventSeq.Load()%50 == 0 {
-		_ = d.store.TrimEventLogs(maxLogs)
+	if d.store != nil {
+		if err := d.store.InsertEventLog(store.EventLog{
+			EventID: evt.ID, CameraID: cameraID, Device: evt.Device,
+			Topic: util.NormalizeTopic(evt.Topic), Transport: evt.Transport,
+			Payload: payload, Matched: matched, Dispatched: dispatched,
+			Channels: channelNames, CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+		}); err != nil {
+			d.log.Warn("事件落库失败", "err", err)
+		} else if maxLogs > 0 && eventSeq.Load()%50 == 0 {
+			_ = d.store.TrimEventLogs(maxLogs)
+		}
 	}
 }
 
@@ -513,7 +595,7 @@ func ValidBodyTemplate(tpl string) bool {
 	return json.Valid([]byte(s))
 }
 
-// Close 停止接收新事件，等 worker 排空队列后关闭文件。
+// Close 停止接收新事件，等 worker 与静默扫描协程退出后关闭文件。
 func (d *Dispatcher) Close() {
 	d.mu.Lock()
 	if d.closed {
@@ -522,6 +604,7 @@ func (d *Dispatcher) Close() {
 	}
 	d.closed = true
 	close(d.queue)
+	close(d.smStop)
 	d.mu.Unlock()
 
 	done := make(chan struct{})

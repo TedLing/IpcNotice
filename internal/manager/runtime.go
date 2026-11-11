@@ -120,6 +120,8 @@ func NewManager(ctx context.Context, store *store.Store, logger *slog.Logger) (*
 		return nil, err
 	}
 	m.dispatcher = d
+	// 持续事件的静默超时判定需要知道设备链路是否健康（订阅失效/断网时不误报结束）。
+	d.SetDeviceHealth(m.deviceHealthy)
 
 	if err := notify.Start(); err != nil {
 		logger.Error("Notify 接收端启动失败（Push 模式将不可用；PullPoint 不受影响）", "err", err)
@@ -240,7 +242,13 @@ func (m *Manager) Reload() error {
 			}
 		}
 		rt.ByCamera[cam.Name] = append(rt.ByCamera[cam.Name],
-			dispatch.Route{Topic: sub.Topic, Channels: picked})
+			dispatch.Route{
+				Topic: sub.Topic, Channels: picked,
+				Mode:              sub.EventMode,
+				InactivityTimeout: sub.InactivityTimeout,
+				NotifyStart:       sub.NotifyStart,
+				NotifyEnd:         sub.NotifyEnd,
+			})
 		routeCount++
 	}
 
@@ -314,6 +322,20 @@ func (m *Manager) setReloadErr(err error) {
 	m.lastReloadErr = err.Error()
 	m.lastReload = time.Now().UTC().Format(time.RFC3339)
 	m.mu.Unlock()
+}
+
+// deviceHealthy 返回设备的事件接收链路是否健康（worker 存在且已连接）。
+// 持续事件的静默超时据此决定是否允许把活动判定为结束：
+// 设备断网、订阅失效或 Worker 异常时返回 false，不产生结束通知。
+func (m *Manager) deviceHealthy(device string) bool {
+	m.mu.RLock()
+	id, ok := m.cameraIDs[device]
+	w := m.workers[id]
+	m.mu.RUnlock()
+	if !ok || w == nil {
+		return false
+	}
+	return w.Status().Connected
 }
 
 // Status 返回运行态总览快照。

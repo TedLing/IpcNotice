@@ -88,6 +88,9 @@ type TopicRemarkInput struct {
 }
 
 // Subscription 是「某台摄像头的某个事件主题」的订阅，含通知渠道。
+// EventMode 是事件生命周期模式：instant（默认，保持冷却去重行为）或
+// sustained（持续事件状态管理：开始/结束通知，活动期间不重复推送）。
+// 注意与全局 settings 的 event_mode（auto/push/pull，传输方式）无关。
 type Subscription struct {
 	ID         int64   `json:"id"`
 	CameraID   int64   `json:"camera_id"`
@@ -95,15 +98,44 @@ type Subscription struct {
 	Topic      string  `json:"topic"`
 	Enabled    bool    `json:"enabled"`
 	ChannelIDs []int64 `json:"channel_ids"`
-	CreatedAt  string  `json:"created_at"`
-	UpdatedAt  string  `json:"updated_at"`
+	// EventMode：instant | sustained。
+	EventMode string `json:"event_mode"`
+	// InactivityTimeout 是 sustained 模式的静默超时秒数（<=0 时按 30 处理）。
+	InactivityTimeout int `json:"inactivity_timeout"`
+	// NotifyStart / NotifyEnd 控制 sustained 模式是否推送开始/结束通知。
+	NotifyStart bool `json:"notify_start"`
+	NotifyEnd   bool `json:"notify_end"`
+	CreatedAt   string `json:"created_at"`
+	UpdatedAt   string `json:"updated_at"`
 }
 
 // SubscriptionInput 是前端批量保存订阅的入参。
 type SubscriptionInput struct {
-	Topic      string  `json:"topic"`
-	Enabled    bool    `json:"enabled"`
-	ChannelIDs []int64 `json:"channel_ids"`
+	Topic             string   `json:"topic"`
+	Enabled           bool     `json:"enabled"`
+	ChannelIDs        []int64  `json:"channel_ids"`
+	EventMode         string   `json:"event_mode"`
+	InactivityTimeout int      `json:"inactivity_timeout"`
+	NotifyStart       bool     `json:"notify_start"`
+	NotifyEnd         bool     `json:"notify_end"`
+}
+
+// EventState 是 sustained 模式下某条持续事件实例的落库状态快照。
+// 状态转换时写入；服务重启后内存状态全部视为 IDLE（未知），等待新事件重新确认，
+// 不会依据停机期间的静默伪造结束通知。
+type EventState struct {
+	StateKey    string `json:"state_key"`
+	CameraID    int64  `json:"camera_id"`
+	Device      string `json:"device"`
+	Topic       string `json:"topic"`
+	Source      string `json:"source"`
+	Phase       string `json:"phase"` // active | idle
+	StartedAt   string `json:"started_at"`
+	LastSeenAt  string `json:"last_seen_at"`
+	EndedAt     string `json:"ended_at"`
+	EndReason   string `json:"end_reason"` // EXPLICIT_STOP | INACTIVITY_TIMEOUT | ""
+	EventCount  int    `json:"event_count"`
+	UpdatedAt   string `json:"updated_at"`
 }
 
 // EventLog 是事件落库记录。
@@ -212,6 +244,10 @@ CREATE TABLE IF NOT EXISTS event_subscriptions (
   camera_id INTEGER NOT NULL REFERENCES cameras(id) ON DELETE CASCADE,
   topic TEXT NOT NULL,
   enabled INTEGER NOT NULL DEFAULT 1,
+  event_mode TEXT NOT NULL DEFAULT 'instant',
+  inactivity_timeout INTEGER NOT NULL DEFAULT 30,
+  notify_start INTEGER NOT NULL DEFAULT 1,
+  notify_end INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   UNIQUE(camera_id, topic)
@@ -235,6 +271,20 @@ CREATE TABLE IF NOT EXISTS event_logs (
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_event_logs_created ON event_logs(created_at DESC);
+CREATE TABLE IF NOT EXISTS event_states (
+  state_key TEXT PRIMARY KEY,
+  camera_id INTEGER NOT NULL DEFAULT 0,
+  device TEXT NOT NULL,
+  topic TEXT NOT NULL,
+  source TEXT NOT NULL DEFAULT '',
+  phase TEXT NOT NULL,
+  started_at TEXT NOT NULL DEFAULT '',
+  last_seen_at TEXT NOT NULL DEFAULT '',
+  ended_at TEXT NOT NULL DEFAULT '',
+  end_reason TEXT NOT NULL DEFAULT '',
+  event_count INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_topics_camera ON camera_topics(camera_id);
 CREATE INDEX IF NOT EXISTS idx_subs_camera ON event_subscriptions(camera_id);
 `
@@ -249,6 +299,9 @@ CREATE INDEX IF NOT EXISTS idx_subs_camera ON event_subscriptions(camera_id);
 		return err
 	}
 	if err := s.ensureCameraSubManagerColumn(); err != nil {
+		return err
+	}
+	if err := s.ensureSubscriptionModeColumns(); err != nil {
 		return err
 	}
 	if _, err := s.Settings(); err != nil {
@@ -359,6 +412,58 @@ func (s *Store) ensureCameraSubManagerColumn() error {
 		return fmt.Errorf("为 cameras 增加 sub_manager 列失败: %w", err)
 	}
 	return nil
+}
+
+// ensureColumn 通用幂等补列：table 缺少 column 时执行 ddl（ALTER TABLE ...）。
+func (s *Store) ensureColumn(table, column, ddl string) error {
+	rows, err := s.db.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		return fmt.Errorf("读取 %s 表结构失败: %w", table, err)
+	}
+	found := false
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt any
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if name == column {
+			found = true
+		}
+	}
+	err = rows.Err()
+	_ = rows.Close() // 单连接：必须关闭后才能执行下面的 ALTER
+	if err != nil {
+		return err
+	}
+	if found {
+		return nil
+	}
+	if _, err := s.db.Exec(ddl); err != nil {
+		return fmt.Errorf("为 %s 增加 %s 列失败: %w", table, column, err)
+	}
+	return nil
+}
+
+// ensureSubscriptionModeColumns 幂等地为旧数据库补上订阅的持续事件模式字段。
+func (s *Store) ensureSubscriptionModeColumns() error {
+	if err := s.ensureColumn("event_subscriptions", "event_mode",
+		`ALTER TABLE event_subscriptions ADD COLUMN event_mode TEXT NOT NULL DEFAULT 'instant'`); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("event_subscriptions", "inactivity_timeout",
+		`ALTER TABLE event_subscriptions ADD COLUMN inactivity_timeout INTEGER NOT NULL DEFAULT 30`); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("event_subscriptions", "notify_start",
+		`ALTER TABLE event_subscriptions ADD COLUMN notify_start INTEGER NOT NULL DEFAULT 1`); err != nil {
+		return err
+	}
+	return s.ensureColumn("event_subscriptions", "notify_end",
+		`ALTER TABLE event_subscriptions ADD COLUMN notify_end INTEGER NOT NULL DEFAULT 1`)
 }
 
 // backfillTopicRemarks 仅用于旧库升级：为还没有备注的历史主题填一次默认中文名。
@@ -831,7 +936,9 @@ func (s *Store) ListTopics(cameraID int64) ([]CameraTopic, error) {
 // ---------------- subscriptions ----------------
 
 func (s *Store) ListSubscriptions(cameraID int64) ([]Subscription, error) {
-	query := `SELECT s.id,s.camera_id,c.name,s.topic,s.enabled,s.created_at,s.updated_at
+	query := `SELECT s.id,s.camera_id,c.name,s.topic,s.enabled,
+		s.event_mode,s.inactivity_timeout,s.notify_start,s.notify_end,
+		s.created_at,s.updated_at
 		FROM event_subscriptions s JOIN cameras c ON c.id=s.camera_id`
 	args := []any{}
 	if cameraID > 0 {
@@ -846,13 +953,20 @@ func (s *Store) ListSubscriptions(cameraID int64) ([]Subscription, error) {
 	out := []Subscription{}
 	for rows.Next() {
 		var sub Subscription
-		var enabled int
+		var enabled, notifyStart, notifyEnd int
 		if err := rows.Scan(&sub.ID, &sub.CameraID, &sub.CameraName, &sub.Topic,
-			&enabled, &sub.CreatedAt, &sub.UpdatedAt); err != nil {
+			&enabled,
+			&sub.EventMode, &sub.InactivityTimeout, &notifyStart, &notifyEnd,
+			&sub.CreatedAt, &sub.UpdatedAt); err != nil {
 			_ = rows.Close()
 			return nil, err
 		}
 		sub.Enabled = enabled != 0
+		if sub.EventMode == "" {
+			sub.EventMode = "instant"
+		}
+		sub.NotifyStart = notifyStart != 0
+		sub.NotifyEnd = notifyEnd != 0
 		sub.ChannelIDs = []int64{}
 		out = append(out, sub)
 	}
@@ -909,8 +1023,17 @@ func (s *Store) ReplaceSubscriptions(cameraID int64, items []SubscriptionInput) 
 		if topic == "" {
 			continue
 		}
-		res, err := tx.Exec(`INSERT INTO event_subscriptions(camera_id,topic,enabled,created_at,updated_at)
-			VALUES(?,?,?,?,?)`, cameraID, topic, b2i(item.Enabled), ts, ts)
+		mode := strings.ToLower(strings.TrimSpace(item.EventMode))
+		if mode == "" {
+			mode = "instant"
+		}
+		if mode != "instant" && mode != "sustained" {
+			mode = "instant"
+		}
+		res, err := tx.Exec(`INSERT INTO event_subscriptions(camera_id,topic,enabled,
+			event_mode,inactivity_timeout,notify_start,notify_end,created_at,updated_at)
+			VALUES(?,?,?,?,?,?,?,?,?)`, cameraID, topic, b2i(item.Enabled),
+			mode, item.InactivityTimeout, b2i(item.NotifyStart), b2i(item.NotifyEnd), ts, ts)
 		if err != nil {
 			return err
 		}
@@ -943,6 +1066,22 @@ func (s *Store) InsertEventLog(e EventLog) error {
 		VALUES(?,?,?,?,?,?,?,?,?,?)`,
 		e.EventID, e.CameraID, e.Device, e.Topic, e.Transport, string(e.Payload),
 		b2i(e.Matched), b2i(e.Dispatched), e.Channels, e.CreatedAt)
+	return err
+}
+
+// UpsertEventState 持久化 sustained 模式事件实例的状态快照（状态转换时调用）。
+// 重复活动事件只更新内存，不写库，避免高频写放大。
+func (s *Store) UpsertEventState(e EventState) error {
+	_, err := s.db.Exec(`INSERT INTO event_states
+		(state_key,camera_id,device,topic,source,phase,started_at,last_seen_at,ended_at,end_reason,event_count,updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+		ON CONFLICT(state_key) DO UPDATE SET
+		  camera_id=excluded.camera_id, phase=excluded.phase,
+		  started_at=excluded.started_at, last_seen_at=excluded.last_seen_at,
+		  ended_at=excluded.ended_at, end_reason=excluded.end_reason,
+		  event_count=excluded.event_count, updated_at=excluded.updated_at`,
+		e.StateKey, e.CameraID, e.Device, e.Topic, e.Source, e.Phase,
+		e.StartedAt, e.LastSeenAt, e.EndedAt, e.EndReason, e.EventCount, e.UpdatedAt)
 	return err
 }
 

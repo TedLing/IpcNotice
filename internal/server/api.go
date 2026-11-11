@@ -632,6 +632,22 @@ func (s *APIServer) saveSubscriptions(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// 持续事件模式参数校验：mode 仅支持 instant/sustained；超时 1~3600 秒。
+	for _, it := range body.Items {
+		mode := strings.ToLower(strings.TrimSpace(it.EventMode))
+		if mode == "" {
+			mode = "instant"
+		}
+		if mode != "instant" && mode != "sustained" {
+			writeErr(w, http.StatusBadRequest,
+				fmt.Sprintf("事件模式仅支持 instant/sustained，当前为 %q", it.EventMode))
+			return
+		}
+		if mode == "sustained" && (it.InactivityTimeout < 0 || it.InactivityTimeout > 3600) {
+			writeErr(w, http.StatusBadRequest, "静默超时需在 0~3600 秒之间（0 表示默认 30 秒）")
+			return
+		}
+	}
 	if err := s.store.ReplaceSubscriptions(id, body.Items); err != nil {
 		writeErr(w, http.StatusBadRequest, "保存订阅失败（检查通知渠道是否存在）: "+err.Error())
 		return

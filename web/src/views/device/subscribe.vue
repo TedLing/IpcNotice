@@ -21,6 +21,12 @@ interface TopicRow {
   selected: boolean;
   enabled: boolean;
   channelIds: number[];
+  /** 事件生命周期模式：instant（默认）| sustained（持续事件状态管理） */
+  eventMode: "instant" | "sustained";
+  /** sustained 静默超时秒数（0 = 默认 30） */
+  inactivityTimeout: number;
+  notifyStart: boolean;
+  notifyEnd: boolean;
 }
 
 /** 表格行：叶子节点挂真实数据 data；分组节点（主题中间层级）仅展示结构 */
@@ -197,23 +203,33 @@ function merge(topics: CameraTopic[], subs: Subscription[]): TopicRow[] {
       remark: t.remark ?? "",
       selected: false,
       enabled: true,
-      channelIds: []
+      channelIds: [],
+      eventMode: "instant",
+      inactivityTimeout: 30,
+      notifyStart: true,
+      notifyEnd: true
     });
   }
   for (const s of subs) {
+    const mode = s.event_mode === "sustained" ? "sustained" : "instant";
+    const patch = {
+      selected: true,
+      enabled: s.enabled,
+      channelIds: [...(s.channel_ids ?? [])],
+      eventMode: mode as "instant" | "sustained",
+      inactivityTimeout: s.inactivity_timeout > 0 ? s.inactivity_timeout : 30,
+      notifyStart: s.notify_start !== false,
+      notifyEnd: s.notify_end !== false
+    };
     const existing = map.get(s.topic);
     if (existing) {
-      existing.selected = true;
-      existing.enabled = s.enabled;
-      existing.channelIds = [...(s.channel_ids ?? [])];
+      Object.assign(existing, patch);
     } else {
       map.set(s.topic, {
         topic: s.topic,
         source: "custom",
         remark: "",
-        selected: true,
-        enabled: s.enabled,
-        channelIds: [...(s.channel_ids ?? [])]
+        ...patch
       });
     }
   }
@@ -265,7 +281,11 @@ async function save() {
     .map(r => ({
       topic: r.topic.trim(),
       enabled: r.enabled,
-      channel_ids: r.channelIds
+      channel_ids: r.channelIds,
+      event_mode: r.eventMode,
+      inactivity_timeout: r.eventMode === "sustained" ? r.inactivityTimeout : 30,
+      notify_start: r.notifyStart,
+      notify_end: r.notifyEnd
     }))
     .filter(i => i.topic);
   if (items.some(i => !i.channel_ids.length)) {
@@ -519,6 +539,51 @@ onMounted(loadBase);
                 :disabled="!c.enabled"
               />
             </el-select>
+          </template>
+        </el-table-column>
+        <el-table-column label="事件模式" width="190">
+          <template #default="{ row }">
+            <div v-if="!row.isGroup" class="flex items-center gap-1">
+              <el-select
+                v-model="row.data.eventMode"
+                :disabled="!row.data.selected"
+                size="small"
+                style="width: 110px"
+              >
+                <el-option label="即时（默认）" value="instant" />
+                <el-option label="持续（开始/结束）" value="sustained" />
+              </el-select>
+              <el-popover
+                v-if="row.data.eventMode === 'sustained'"
+                trigger="click"
+                width="260"
+              >
+                <template #reference>
+                  <el-button size="small" link type="primary">设置</el-button>
+                </template>
+                <div class="flex flex-col gap-2 text-xs">
+                  <div class="flex items-center justify-between gap-2">
+                    <span>静默超时（秒）</span>
+                    <el-input-number
+                      v-model="row.data.inactivityTimeout"
+                      :min="0"
+                      :max="3600"
+                      size="small"
+                      style="width: 110px"
+                    />
+                  </div>
+                  <div class="text-gray-400">0 表示默认 30 秒；持续期间不再有事件即判定结束</div>
+                  <div class="flex items-center justify-between">
+                    <span>开始通知</span>
+                    <el-switch v-model="row.data.notifyStart" size="small" />
+                  </div>
+                  <div class="flex items-center justify-between">
+                    <span>结束通知</span>
+                    <el-switch v-model="row.data.notifyEnd" size="small" />
+                  </div>
+                </div>
+              </el-popover>
+            </div>
           </template>
         </el-table-column>
         <el-table-column label="启用" width="80" align="center">

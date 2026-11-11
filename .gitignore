@@ -1,0 +1,30 @@
+# 编译产物（由 builder.bat / GitHub Action 生成，勿入仓库）
+/ipcnotice.exe
+/ipcnotice
+/ipcnotice-linux-amd64
+/ipcnotice-linux-arm64
+*.exe
+*.test
+nul
+
+# 登录凭据与运行数据（含设备账号密码，切勿提交）
+/config.json
+/data/
+/logs/
+*.db
+*.db-shm
+*.db-wal
+*.jsonl
+*.log
+
+# 仅本地使用的 AI 协作文档（含内网地址、设备型号与环境细节，勿上传）
+/readme_ai.md
+/readme_ai*
+
+# WorkBuddy 项目工作记忆（含环境细节，勿上传）
+/.workbuddy/
+
+# 前端依赖与本地缓存
+/web/node_modules/
+/web/.eslintcache
+/web/.vite/

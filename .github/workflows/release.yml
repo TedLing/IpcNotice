@@ -1,0 +1,184 @@
+name: Build & Release
+
+# 触发方式：
+#   1) 推送 v* 标签自动编译发版：git tag v0.2.0 && git push origin v0.2.0
+#   2) GitHub 页面手动运行 workflow_dispatch，填写版本号（可不带已有 tag）
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "发布版本号，例如 v0.2.0"
+        required: true
+        default: "v0.2.0"
+      prerelease:
+        description: "标记为预发布"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  # ---------------------------------------------------------------
+  # 前端只构建一次，产物交给所有平台的打包任务复用
+  # ---------------------------------------------------------------
+  frontend:
+    name: Build web/dist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+          run_install: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: Install dependencies
+        working-directory: web
+        run: pnpm install --frozen-lockfile
+
+      - name: Build frontend
+        working-directory: web
+        run: pnpm build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist/
+          retention-days: 3
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------
+  # 交叉编译：pure Go（modernc.org/sqlite + pion + gortsplib），无需 cgo
+  # ---------------------------------------------------------------
+  build:
+    name: Build ${{ matrix.name }}
+    needs: frontend
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: windows-amd64, goos: windows, goarch: amd64, ext: ".exe", archive: zip }
+          - { name: linux-amd64,   goos: linux,   goarch: amd64, ext: "",     archive: tar.gz }
+          - { name: linux-arm64,   goos: linux,   goarch: arm64, ext: "",     archive: tar.gz }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+
+      - name: Verify Go code
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          go vet ./...
+          go test ./...
+
+      - name: Build binary
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          mkdir -p build
+          go build -trimpath \
+            -ldflags "-s -w -X main.version=${RELEASE_TAG}" \
+            -o "build/ipcnotice${{ matrix.ext }}" .
+
+      - name: Assemble release package
+        env:
+          TARGET: ${{ matrix.name }}
+          EXT: ${{ matrix.ext }}
+          ARCHIVE: ${{ matrix.archive }}
+        run: |
+          set -euo pipefail
+          NAME="ipcnotice-${RELEASE_TAG}-${TARGET}"
+          mkdir -p "package/${NAME}/web" out
+          cp "build/ipcnotice${EXT}" "package/${NAME}/"
+          cp -R web/dist "package/${NAME}/web/dist"
+          cp README.md config.example.json "package/${NAME}/"
+          printf '%s\n' "${RELEASE_TAG}" > "package/${NAME}/VERSION"
+          if [ "${ARCHIVE}" = "zip" ]; then
+            (cd package && zip -qr "../out/${NAME}.zip" "${NAME}")
+          else
+            tar -czf "out/${NAME}.tar.gz" -C package "${NAME}"
+          fi
+          ls -lh out/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-${{ matrix.name }}
+          path: out/*
+          retention-days: 3
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------
+  # 汇总产物、生成校验和并创建 GitHub Release
+  # ---------------------------------------------------------------
+  release:
+    name: Publish release
+    needs: [frontend, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: package-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate checksums
+        working-directory: artifacts
+        run: |
+          sha256sum *.zip *.tar.gz > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: IpcNotice ${{ env.RELEASE_TAG }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ github.event.inputs.prerelease == 'true' || contains(env.RELEASE_TAG, '-') }}
+          files: |
+            artifacts/*.zip
+            artifacts/*.tar.gz
+            artifacts/SHA256SUMS.txt
+          body: |
+            ### 下载说明
+
+            解压后保持目录结构（`web/dist` 必须与可执行文件同级），然后运行：
+
+            - Windows：`ipcnotice.exe`
+            - Linux：`chmod +x ipcnotice && ./ipcnotice`
+
+            首次启动会生成 `config.json`（默认密码 `change-me`），**请立即修改后重启**，
+            再打开 `http://127.0.0.1:8080` 完成摄像头与订阅配置。
+
+            压缩包内含 `SHA256SUMS` 校验和（见本 Release 附件）。

@@ -128,13 +128,29 @@ onUnmounted(() => timer && clearInterval(timer));
                   <el-descriptions-item label="最近回调时间">
                     {{ fmtTime(row.last_notify_at) }}
                   </el-descriptions-item>
+                  <el-descriptions-item label="健康探测">
+                    {{ fmtTime(row.last_probe_at) || "-" }}
+                    <el-tag v-if="row.probe_fails > 0" type="warning" size="small" class="ml-1">
+                      连续失败 {{ row.probe_fails }} 次
+                    </el-tag>
+                    <span v-if="row.last_probe_err" class="text-red-500 ml-1">{{ row.last_probe_err }}</span>
+                  </el-descriptions-item>
                   <el-descriptions-item label="启动时间">{{ fmtTime(row.started_at) }}</el-descriptions-item>
                   <el-descriptions-item label="更新时间">{{ fmtTime(row.updated_at) }}</el-descriptions-item>
                 </el-descriptions>
               </template>
             </el-table-column>
             <el-table-column prop="device" label="设备" width="140" show-overflow-tooltip />
-            <el-table-column label="状态" width="90">
+            <el-table-column label="设备" width="90">
+              <template #default="{ row }">
+                <el-tooltip :content="`最近探测 ${row.last_probe_at ? fmtTime(row.last_probe_at) : '-'}${row.last_probe_err ? '：' + row.last_probe_err : ''}`" placement="top">
+                  <el-tag :type="row.device_online ? 'success' : 'danger'" size="small">
+                    {{ row.device_online ? "在线" : "离线" }}
+                  </el-tag>
+                </el-tooltip>
+              </template>
+            </el-table-column>
+            <el-table-column label="订阅" width="90">
               <template #default="{ row }">
                 <el-tag :type="row.connected ? 'success' : 'warning'" size="small">
                   {{ row.connected ? "已连接" : "未连接" }}

@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -191,5 +192,43 @@ func TestDedupTTLExpiry(t *testing.T) {
 	d.seenMu.Unlock()
 	if d.isDuplicate(dedupEvent("cam", topic, "Changed", on)) {
 		t.Fatal("TTL 过期后同一状态应重新放行")
+	}
+}
+
+// TestConfigureJSONLCloseOnEmptyPath 验证热更新清空日志路径时关闭旧文件，
+// 以及设置 Normalize 不再把空的 event_log_file 回填为默认值（清空 = 关闭 JSONL）。
+func TestConfigureJSONLCloseOnEmptyPath(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "events.jsonl")
+
+	d := newTestDispatcher(60)
+	st := config.DefaultSettings()
+	st.EventLogFile = p
+	if err := d.configure(st, false); err != nil {
+		t.Fatalf("启用 JSONL 失败: %v", err)
+	}
+	if d.logFile == nil {
+		t.Fatal("启用后 logFile 不应为 nil")
+	}
+
+	// 清空路径：旧文件必须关闭，引用清空
+	if err := d.configure(config.Settings{DedupSeconds: 60}, false); err != nil {
+		t.Fatalf("清空日志路径失败: %v", err)
+	}
+	if d.logFile != nil {
+		t.Fatal("清空路径后 logFile 应为 nil（旧文件已关闭）")
+	}
+	if d.logFilePath != "" {
+		t.Fatalf("清空路径后 logFilePath 应为空，实际 %q", d.logFilePath)
+	}
+
+	// Settings.Normalize 不回填空 EventLogFile
+	ns := config.DefaultSettings()
+	ns.EventLogFile = ""
+	if err := ns.Normalize(); err != nil {
+		t.Fatalf("Normalize 失败: %v", err)
+	}
+	if ns.EventLogFile != "" {
+		t.Fatalf("Normalize 不应回填清空的日志路径，实际 %q", ns.EventLogFile)
 	}
 }

@@ -280,6 +280,15 @@ func (d *Dispatcher) configure(st config.Settings, reopen bool) error {
 		return nil
 	}
 	if st.EventLogFile == "" {
+		// 热更新清空日志路径：关闭旧文件并清空引用，避免继续向已废弃路径写入。
+		if d.logFile != nil {
+			_ = d.logFile.Close()
+			d.logFile = nil
+			if reopen {
+				d.log.Info("事件 JSONL 已关闭（日志文件路径已清空）")
+			}
+		}
+		d.logFilePath = ""
 		return nil
 	}
 	if err := os.MkdirAll(filepath.Dir(st.EventLogFile), 0o755); err != nil {

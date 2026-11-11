@@ -158,6 +158,11 @@ func (d *Dispatcher) processSustained(dev *config.DeviceConfig, raw Event, s sus
 
 	var lifecycle Event
 	pushLifecycle := false
+	// 快照：锁内复制通道/名称等设置，锁外只使用局部快照。
+	// st.settings 可能被其他事件协程更新（携带更具体规则的活动事件），
+	// 解锁后再读 st 即为数据竞争；started 分支直接用入参 s（值拷贝，安全）。
+	var channels []store.WebhookChannel
+	var names string
 	switch {
 	case !st.active && !activity:
 		// IDLE + 明确结束 → 忽略
@@ -169,6 +174,7 @@ func (d *Dispatcher) processSustained(dev *config.DeviceConfig, raw Event, s sus
 		lifecycle = d.buildLifecycleEvent(st, raw, PhaseEnded, EndExplicit, endedAt)
 		st.active = false
 		pushLifecycle = st.settings.notifyEnd
+		channels, names = st.settings.channels, st.settings.names
 		d.persistState(st, PhaseEnded, EndExplicit, endedAt)
 		d.smMu.Unlock()
 	case !st.active:
@@ -181,6 +187,7 @@ func (d *Dispatcher) processSustained(dev *config.DeviceConfig, raw Event, s sus
 		st.lastEvent = raw
 		lifecycle = d.buildLifecycleEvent(st, raw, PhaseStarted, "", now)
 		pushLifecycle = s.notifyStart
+		channels, names = s.channels, s.names
 		d.persistState(st, PhaseStarted, "", now)
 		d.smMu.Unlock()
 	default:
@@ -196,8 +203,9 @@ func (d *Dispatcher) processSustained(dev *config.DeviceConfig, raw Event, s sus
 	}
 
 	// 锁外入队：lifecycle 通知绕过冷却去重，直接走 sustained 通道。
+	// 只使用锁内复制的局部快照，不读 st。
 	d.enqueueItem(dispatchItem{evt: lifecycle, route: &routeDirect{
-		channels: st.settings.channels, names: st.settings.names,
+		channels: channels, names: names,
 		matched: true, push: pushLifecycle,
 	}}, dev.Name, lifecycle.Topic)
 }
@@ -262,8 +270,11 @@ func (d *Dispatcher) scanInactivity() {
 	now := d.smNow()
 
 	type emission struct {
-		evt Event
-		st  *eventState
+		evt      Event
+		device   string
+		channels []store.WebhookChannel
+		names    string
+		push     bool
 	}
 	var emissions []emission
 
@@ -285,14 +296,19 @@ func (d *Dispatcher) scanInactivity() {
 		st.active = false
 		evt := d.buildLifecycleEvent(st, st.lastEvent, PhaseEnded, EndInactivity, now)
 		d.persistState(st, PhaseEnded, EndInactivity, now)
-		emissions = append(emissions, emission{evt: evt, st: st})
+		// 锁内复制需要的快照，解锁后只使用局部值（st 可能被其他协程并发更新）。
+		emissions = append(emissions, emission{
+			evt: evt, device: st.device,
+			channels: st.settings.channels, names: st.settings.names,
+			push: st.settings.notifyEnd,
+		})
 	}
 	d.smMu.Unlock()
 
 	for _, em := range emissions {
 		d.enqueueItem(dispatchItem{evt: em.evt, route: &routeDirect{
-			channels: em.st.settings.channels, names: em.st.settings.names,
-			matched: true, push: em.st.settings.notifyEnd,
-		}}, em.st.device, em.evt.Topic)
+			channels: em.channels, names: em.names,
+			matched: true, push: em.push,
+		}}, em.device, em.evt.Topic)
 	}
 }

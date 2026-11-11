@@ -54,6 +54,12 @@ type WorkerStatus struct {
 	LastUnsubOK  bool   `json:"last_unsubscribe_ok"` // 最近一次退订结果
 	SubManager   string `json:"sub_manager"`         // 当前已知的设备端订阅管理地址
 	LastNotifyAt string `json:"last_notify_at"`      // 最近收到该设备回调的时间（由 NotifyServer 填充）
+
+	// ---- 设备健康探测（独立于订阅状态：订阅中断但设备可能在线）----
+	DeviceOnline bool   `json:"device_online"` // ONVIF 服务可达（连续失败 3 次判定离线）
+	LastProbeAt  string `json:"last_probe_at"` // 最近一次探测时间
+	ProbeFails   int    `json:"probe_fails"`   // 当前连续探测失败次数
+	LastProbeErr string `json:"last_probe_err"`
 }
 
 // DeviceHash 用于判断「影响订阅的配置」是否变化，变化时才需重建订阅。
@@ -88,21 +94,38 @@ type CameraWorker struct {
 	retired atomic.Bool // stop() 后置位：不再允许创建/续约订阅
 
 	staleWarnOnce sync.Once // 残留订阅清理失败只告警一次，避免重连风暴刷屏
+	startOnce     sync.Once // Start 只允许启动一次 run/healthLoop，防止重复健康检查协程
+
+	// kick 在设备健康探测从离线恢复在线时触发一次，让 run() 提前结束退避等待，
+	// 立即尝试重建订阅（容量 1，非阻塞发送，不丢语义——最多合并多次恢复信号）。
+	kick chan struct{}
 
 	mu     sync.RWMutex
 	status WorkerStatus
 }
+
+// 健康探测与退避参数。
+const (
+	probeInterval    = 30 * time.Second  // 每 30 秒探测一次 ONVIF 服务
+	probeFailOffline = 3                 // 连续失败 3 次判定设备离线
+	probeTimeout     = 10 * time.Second  // 单次探测超时
+	backoffInitial   = 3 * time.Second   // 重连退避初值
+	backoffMax       = 120 * time.Second // 重连退避上限，恢复成功后重置
+	backoffResetAge  = 60 * time.Second  // 订阅存活超过该时长后再次失败，退避重置
+)
 
 func NewCameraWorker(host WorkerHost, dev *config.DeviceConfig, hash string, cameraID int64) *CameraWorker {
 	ctx, cancel := context.WithCancel(host.Context())
 	w := &CameraWorker{
 		host: host, hash: hash, ctx: ctx, cancel: cancel, cameraID: cameraID,
 		done: make(chan struct{}),
+		kick: make(chan struct{}, 1),
 		status: WorkerStatus{
-			CameraID:  cameraID,
-			Device:    dev.Name,
-			StartedAt: time.Now().UTC().Format(time.RFC3339),
-			UpdatedAt: time.Now().UTC().Format(time.RFC3339),
+			CameraID:     cameraID,
+			Device:       dev.Name,
+			StartedAt:    time.Now().UTC().Format(time.RFC3339),
+			UpdatedAt:    time.Now().UTC().Format(time.RFC3339),
+			DeviceOnline: true, // 乐观初始：由探测结果修正
 		},
 	}
 	w.dev.Store(dev)
@@ -131,14 +154,6 @@ func (w *CameraWorker) setStatus(transport string, connected bool, errText strin
 
 func nowStr() string { return time.Now().UTC().Format(time.RFC3339) }
 
-func (w *CameraWorker) recordCreate(at string, ok bool) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.status.CreateCount++
-	w.status.LastCreateAt = at
-	w.status.LastCreateOK = ok
-}
-
 func (w *CameraWorker) recordRenew(errText string) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -160,6 +175,94 @@ func (w *CameraWorker) recordSubManager(ref string) {
 	w.status.SubManager = ref
 }
 
+// recordCreate 记录一次订阅创建结果；成功即证明设备可达，同步健康探测状态。
+func (w *CameraWorker) recordCreate(at string, ok bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.status.CreateCount++
+	w.status.LastCreateAt = at
+	w.status.LastCreateOK = ok
+	if ok {
+		w.status.DeviceOnline = true
+		w.status.ProbeFails = 0
+		w.status.LastProbeErr = ""
+	}
+}
+
+// recordProbe 记录一次设备健康探测结果，返回（当前在线, 是否刚从离线恢复）。
+func (w *CameraWorker) recordProbe(ok bool, errText string) (online, recovered bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.status.LastProbeAt = nowStr()
+	w.status.LastProbeErr = errText
+	if ok {
+		w.status.ProbeFails = 0
+		recovered = !w.status.DeviceOnline
+		w.status.DeviceOnline = true
+	} else {
+		w.status.ProbeFails++
+		if w.status.ProbeFails >= probeFailOffline {
+			w.status.DeviceOnline = false
+		}
+	}
+	return w.status.DeviceOnline, recovered
+}
+
+// probeDevice 做一次轻量 ONVIF 探测（构造客户端 + Initialize 设备信息/对时）。
+func (w *CameraWorker) probeDevice() error {
+	cli, err := NewDeviceClient(w.Device())
+	if err != nil {
+		return fmt.Errorf("创建 ONVIF 客户端失败: %w", err)
+	}
+	pctx, cancel := context.WithTimeout(w.ctx, probeTimeout)
+	defer cancel()
+	if err := cli.Initialize(pctx); err != nil {
+		return fmt.Errorf("ONVIF 初始化失败: %w", err)
+	}
+	return nil
+}
+
+// healthLoop 设备健康探测协程：每 30 秒探测一次 ONVIF 服务，连续失败 3 次
+// 判定设备离线；从离线恢复在线时 kick 通知订阅循环提前重试。
+// 每个 worker 仅启动一个（由 startOnce 保证），随 ctx 取消退出。
+func (w *CameraWorker) healthLoop() {
+	ticker := time.NewTicker(probeInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-w.ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		if w.retired.Load() {
+			return
+		}
+		err := w.probeDevice()
+		if err != nil && w.ctx.Err() != nil {
+			return // 探测被停止打断，直接退出
+		}
+		_, recovered := w.recordProbe(err == nil, errTextOf(err))
+		switch {
+		case err == nil && recovered:
+			w.logger().Info("设备健康探测：恢复在线", "device", w.Device().Name)
+			select {
+			case w.kick <- struct{}{}:
+			default:
+			}
+		case err == nil:
+			w.logger().Debug("设备健康探测正常", "device", w.Device().Name)
+		default:
+			if st := w.Status(); st.ProbeFails == probeFailOffline {
+				w.logger().Warn("设备健康探测连续失败，判定设备离线",
+					"device", w.Device().Name, "err", err)
+			} else {
+				w.logger().Debug("设备健康探测失败", "device", w.Device().Name,
+					"fails", st.ProbeFails, "err", err)
+			}
+		}
+	}
+}
+
 // Status 返回当前订阅运行状态快照。
 func (w *CameraWorker) Status() WorkerStatus {
 	w.mu.RLock()
@@ -167,22 +270,33 @@ func (w *CameraWorker) Status() WorkerStatus {
 	return w.status
 }
 
-// Start 启动 worker 的订阅循环。
-func (w *CameraWorker) Start() { go w.run() }
+// Start 启动 worker 的订阅循环与健康探测协程（各一个，startOnce 保证不重复）。
+func (w *CameraWorker) Start() {
+	w.startOnce.Do(func() {
+		go w.run()
+		go w.healthLoop()
+	})
+}
 
 // RefreshDevice 在改名等不重建订阅的变更后，原子刷新设备配置指针。
 func (w *CameraWorker) RefreshDevice(dev *config.DeviceConfig) { w.dev.Store(dev) }
 
 func (w *CameraWorker) run() {
 	defer close(w.done)
-	backoff := 3 * time.Second
+	backoff := backoffInitial
 	for {
 		if w.ctx.Err() != nil {
 			return
 		}
+		started := time.Now()
 		err := w.serveOnce()
 		if w.ctx.Err() != nil {
 			return
+		}
+		// 上一次订阅存活超过阈值（恢复成功运行过一段时间）后再次失败：
+		// 视为新故障，退避重置。短时间内的连续失败则继续指数增长。
+		if time.Since(started) >= backoffResetAge {
+			backoff = backoffInitial
 		}
 		msg := ""
 		if err != nil {
@@ -191,15 +305,18 @@ func (w *CameraWorker) run() {
 				"backoff", backoff.String())
 		}
 		w.setStatus("", false, msg)
+		// 指数退避等待；设备健康探测从离线恢复在线时提前唤醒，立即重建订阅。
 		select {
 		case <-w.ctx.Done():
 			return
+		case <-w.kick:
+			w.logger().Info("设备恢复在线，提前重试订阅重建", "device", w.Device().Name)
 		case <-time.After(backoff):
 		}
-		if backoff < 30*time.Second {
+		if backoff < backoffMax {
 			backoff *= 2
-			if backoff > 30*time.Second {
-				backoff = 30 * time.Second
+			if backoff > backoffMax {
+				backoff = backoffMax
 			}
 		}
 	}

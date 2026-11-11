@@ -186,9 +186,9 @@ func (s *Settings) Normalize() error {
 	if s.MaxEventLogs < 100 {
 		s.MaxEventLogs = d.MaxEventLogs
 	}
-	if strings.TrimSpace(s.EventLogFile) == "" {
-		s.EventLogFile = d.EventLogFile
-	}
+	// 注意：EventLogFile 刻意不做空值回填——显式清空表示关闭 JSONL 事件日志，
+	// Dispatcher.configure 会关闭已打开的日志文件。首次启动的默认值由
+	// DefaultSettings / Store.Settings 的无记录分支提供。
 	return nil
 }
 

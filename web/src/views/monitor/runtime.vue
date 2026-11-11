@@ -2,6 +2,7 @@
 import { ref, onMounted, onUnmounted } from "vue";
 import { ElMessage } from "element-plus";
 import { ipcApi, type RuntimeInfo } from "@/api/ipc";
+import { formatLocalTime } from "@/utils/time";
 
 defineOptions({ name: "MonitorRuntime" });
 
@@ -36,7 +37,7 @@ async function doReload() {
 }
 
 function fmtTime(v: string) {
-  return v ? v.replace("T", " ").slice(0, 19) : "-";
+  return formatLocalTime(v);
 }
 
 onMounted(() => {

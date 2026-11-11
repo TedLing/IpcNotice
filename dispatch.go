@@ -14,6 +14,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	_ "time/tzdata" // 内嵌时区数据库，保证交叉编译/精简容器下 LoadLocation("Asia/Shanghai") 可用
 
 	"github.com/mickeyzzc/onvif-go/v2/events"
 	"github.com/mickeyzzc/onvif-go/v2/onvif"
@@ -445,18 +446,29 @@ func pushContent(evt Event) string {
 	return fmt.Sprintf("摄像头%s 发生了%s事件，触发时间 %s", evt.Device, evt.Title, formatEventTime(evt))
 }
 
+// cst 是中国标准时间（UTC+8）。通知时间统一按此时区展示，避免依赖运行机器
+// 的本地时区（CI/容器常为 UTC），保证行为确定且符合国内使用场景。
+var cst = func() *time.Location {
+	loc, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		return time.UTC
+	}
+	return loc
+}()
+
 // formatEventTime 优先设备时间，其次本机接收时间，都解析失败时原样返回。
+// 解析成功后固定按中国时区（UTC+8）展示，不随运行机器时区变化。
 func formatEventTime(evt Event) string {
 	for _, s := range []string{evt.DeviceTime, evt.ReceivedAt} {
 		if s == "" {
 			continue
 		}
 		if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
-			return t.Local().Format("2006-01-02 15:04:05")
+			return t.In(cst).Format("2006-01-02 15:04:05")
 		}
 		return s
 	}
-	return time.Now().Format("2006-01-02 15:04:05")
+	return time.Now().In(cst).Format("2006-01-02 15:04:05")
 }
 
 // renderBodyTemplate 把请求体模板里的 {title} / {content} 占位符替换为实际内容。

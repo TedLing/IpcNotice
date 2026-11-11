@@ -134,6 +134,7 @@ const (
 	staleCleanBudget = 10 * time.Second // 残留清理总时间预算（须小于 Stop 等待上限）
 	staleCleanPerRef = 6 * time.Second  // 单个引用的清理超时（受总预算约束）
 	stopWait         = 12 * time.Second // Stop 等待 worker 退出的上限
+	renewExitWait    = 3 * time.Second  // 退订前等待续约协程退出的上限（见 runPushLease）
 )
 
 func NewCameraWorker(host WorkerHost, dev *config.DeviceConfig, hash string, cameraID int64) *CameraWorker {
@@ -700,6 +701,17 @@ func (w *CameraWorker) runPushLease(svc *events.Service, sub *events.PushSubscri
 	case <-w.ctx.Done():
 	}
 	cancel()
+	// 等续约协程真正退出后再退订，避免 RenewPush 与 UnsubscribePush 同时
+	// 操作同一个订阅（cancel() 只是通知，不等于协程已退出）。正常情况下
+	// RenewPush 的在途请求会随 loopCtx 取消立即中止、等待瞬间完成（若
+	// select 本就走 done 分支则立即返回）；设上限 renewExitWait 防止底层
+	// HTTP 不响应 Context 时拖穿 Stop 等待预算，超时则告警后退订。
+	select {
+	case <-done:
+	case <-time.After(renewExitWait):
+		w.logger().Warn("续约协程退出超时，继续执行退订（可能与在途续约短暂并发）",
+			"device", w.Device().Name)
+	}
 	// 主动退订；成功则清空当前引用并持久化（仅剩待清理列表），
 	// 失败则把地址转入待清理列表，随重连/下次启动重试。
 	if w.unsubscribeBestEffort(svc, sub) {

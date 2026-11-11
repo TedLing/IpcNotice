@@ -87,7 +87,7 @@ export interface WebhookChannel {
   /** 固定 POST */
   method: string;
   headers: Record<string, string>;
-  /** 请求体模板（JSON 文本，占位符 {title} / {content}）；{content} 为三行文本（摄像头/事件/触发时间），渲染时自动 JSON 转义；留空推送完整事件 JSON */
+  /** 请求体模板（JSON 文本，占位符 {title} / {content}）；{content} 为带标题头的多行文本（标题/摄像头/事件/触发时间），渲染时自动 JSON 转义；留空推送完整事件 JSON */
   body_template: string;
   enabled: boolean;
   timeout_seconds: number;

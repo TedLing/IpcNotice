@@ -2,6 +2,7 @@
 import { ref, onMounted, onUnmounted } from "vue";
 import { ElMessage } from "element-plus";
 import { ipcApi, type EventLog } from "@/api/ipc";
+import { formatLocalTime } from "@/utils/time";
 
 defineOptions({ name: "MonitorEvents" });
 
@@ -42,7 +43,7 @@ function showDetail(row: EventLog) {
 }
 
 function fmtTime(v: string) {
-  return v ? v.replace("T", " ").slice(0, 23) : "-";
+  return formatLocalTime(v, true);
 }
 
 onMounted(() => {

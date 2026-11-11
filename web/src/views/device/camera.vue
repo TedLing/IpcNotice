@@ -3,6 +3,7 @@ import { ref, reactive, onMounted, onBeforeUnmount, nextTick } from "vue";
 import { useRouter } from "vue-router";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { ipcApi, type Camera, type DeviceTestResult, type DeviceInfoResult, type DeviceInfoItem, type DeviceInfoSection, type PreviewAnswer } from "@/api/ipc";
+import { formatLocalTime } from "@/utils/time";
 
 defineOptions({ name: "DeviceCamera" });
 
@@ -184,7 +185,7 @@ function sectionStats(sec: DeviceInfoSection) {
 }
 
 function fmtTime(v: string) {
-  return v ? v.replace("T", " ").slice(0, 19) : "-";
+  return formatLocalTime(v);
 }
 
 /** 打开预览弹窗：创建浏览器 PeerConnection，与后端交换 SDP 后播放视频 */

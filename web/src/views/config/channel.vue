@@ -2,6 +2,7 @@
 import { ref, reactive, onMounted } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { ipcApi, type WebhookChannel } from "@/api/ipc";
+import { formatLocalTime } from "@/utils/time";
 
 defineOptions({ name: "ConfigChannel" });
 
@@ -199,7 +200,7 @@ function fillExample() {
 }
 
 function fmtTime(v: string) {
-  return v ? v.replace("T", " ").slice(0, 19) : "-";
+  return formatLocalTime(v);
 }
 
 onMounted(load);
@@ -312,7 +313,7 @@ onMounted(load);
               <el-button size="small" @click="fillExample">填入示例</el-button>
               <span class="text-xs text-gray-400">
                 占位符仅支持 {title}（摄像头xxx 发生-xxxx事件名称）与
-                {content}（三行文本：摄像头 / 事件 / 触发时间，渲染时自动转义为 \n）
+                {content}（带标题头的多行文本：标题 / 摄像头 / 事件 / 触发时间，渲染时自动转义为 \n）
               </span>
             </div>
           </div>

@@ -53,7 +53,7 @@ func TestRenderBodyTemplate(t *testing.T) {
 		t.Errorf("PushTitle = %q", got)
 	}
 	// 触发时间优先取 ReceivedAt（TP-Link 的设备 utcTime 在订阅期内冻结不更新）
-	want := "摄像头：camera-01\n事件：发生了移动侦测事件\n触发时间：2026-11-10 16:00:01"
+	want := "📹IpcNotice订阅消息通知\n摄像头：camera-01\n事件：发生了移动侦测事件\n触发时间：2026-11-10 16:00:01"
 	if got := PushContent(evt); got != want {
 		t.Errorf("PushContent = %q, want %q", got, want)
 	}

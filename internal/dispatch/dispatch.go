@@ -449,10 +449,11 @@ func PushTitle(evt Event) string {
 	return fmt.Sprintf("摄像头%s 发生-%s", evt.Device, evt.Title)
 }
 
-// PushContent 组装占位符 {content}：多行文本——摄像头名称 / 事件描述 / 触发时间。
-// 换行符是真实换行；渲染进 JSON 模板时由 RenderBodyTemplate 做 JSON 转义（\n）。
+// PushContent 组装占位符 {content}：首行 Emoji 标题头 + 多行文本
+// （摄像头名称 / 事件描述 / 触发时间）。换行符是真实换行；
+// 渲染进 JSON 模板时由 RenderBodyTemplate 做 JSON 转义（\n）。
 func PushContent(evt Event) string {
-	return fmt.Sprintf("摄像头：%s\n事件：发生了%s事件\n触发时间：%s",
+	return fmt.Sprintf("📹IpcNotice订阅消息通知\n摄像头：%s\n事件：发生了%s事件\n触发时间：%s",
 		evt.Device, evt.Title, FormatEventTime(evt))
 }
 

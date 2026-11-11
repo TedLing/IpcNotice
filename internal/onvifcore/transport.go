@@ -1,4 +1,4 @@
-package main
+package onvifcore
 
 import (
 	"bytes"
@@ -51,9 +51,9 @@ func (t *xmlSanitizeTransport) RoundTrip(req *http.Request) (*http.Response, err
 	return resp, nil
 }
 
-// newONVIFHTTPClient 构造带容错传输层的 HTTP 客户端。
+// NewONVIFHTTPClient 构造带容错传输层的 HTTP 客户端。
 // 注意：WithHTTPClient 必须在 WithTimeout 之前应用，否则超时设置会被覆盖。
-func newONVIFHTTPClient(timeout time.Duration) *http.Client {
+func NewONVIFHTTPClient(timeout time.Duration) *http.Client {
 	return &http.Client{
 		Timeout: timeout,
 		Transport: &xmlSanitizeTransport{

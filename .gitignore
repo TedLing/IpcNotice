@@ -1,4 +1,5 @@
 # 编译产物（由 builder.bat / GitHub Action 生成，勿入仓库）
+/dist/
 /ipcnotice.exe
 /ipcnotice
 /ipcnotice-linux-amd64

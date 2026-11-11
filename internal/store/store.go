@@ -1,4 +1,5 @@
-package main
+// Package store 封装 SQLite 访问：摄像头、Webhook 通道、订阅、事件主题与事件日志。
+package store
 
 import (
 	"database/sql"
@@ -10,10 +11,13 @@ import (
 	"strings"
 	"time"
 
+	"IpcNotice/internal/config"
+	"IpcNotice/internal/util"
 	_ "modernc.org/sqlite"
 )
 
-const databaseFile = "data/ipcnotice.db"
+// DatabaseFile 是 SQLite 数据库文件的默认路径（可被 -db 覆盖）。
+const DatabaseFile = "data/ipcnotice.db"
 
 // Camera 是一台 ONVIF 摄像头（数据库记录）。
 type Camera struct {
@@ -38,10 +42,10 @@ type Camera struct {
 }
 
 // Device 把数据库记录转换为运行期设备配置。
-func (c Camera) Device() (*DeviceConfig, error) {
-	d := &DeviceConfig{ID: c.ID, Name: c.Name, URL: c.URL, Username: c.Username,
+func (c Camera) Device() (*config.DeviceConfig, error) {
+	d := &config.DeviceConfig{ID: c.ID, Name: c.Name, URL: c.URL, Username: c.Username,
 		Password: c.Password, SubManager: c.SubManager}
-	if err := d.resolve(); err != nil {
+	if err := d.Resolve(); err != nil {
 		return nil, err
 	}
 	return d, nil
@@ -248,7 +252,7 @@ CREATE INDEX IF NOT EXISTS idx_subs_camera ON event_subscriptions(camera_id);
 		return err
 	}
 	if _, err := s.Settings(); err != nil {
-		_ = s.SaveSettings(DefaultSettings())
+		_ = s.SaveSettings(config.DefaultSettings())
 	}
 	return nil
 }
@@ -413,26 +417,26 @@ func b2i(v bool) int {
 
 // ---------------- settings ----------------
 
-func (s *Store) Settings() (Settings, error) {
+func (s *Store) Settings() (config.Settings, error) {
 	var raw string
 	err := s.db.QueryRow(`SELECT value FROM settings WHERE key='app'`).Scan(&raw)
 	if errors.Is(err, sql.ErrNoRows) {
-		return DefaultSettings(), nil
+		return config.DefaultSettings(), nil
 	}
 	if err != nil {
-		return Settings{}, err
+		return config.Settings{}, err
 	}
-	st := DefaultSettings()
+	st := config.DefaultSettings()
 	if err := json.Unmarshal([]byte(raw), &st); err != nil {
-		return Settings{}, fmt.Errorf("settings 记录损坏: %w", err)
+		return config.Settings{}, fmt.Errorf("settings 记录损坏: %w", err)
 	}
 	if err := st.Normalize(); err != nil {
-		return Settings{}, err
+		return config.Settings{}, err
 	}
 	return st, nil
 }
 
-func (s *Store) SaveSettings(st Settings) error {
+func (s *Store) SaveSettings(st config.Settings) error {
 	if err := st.Normalize(); err != nil {
 		return err
 	}
@@ -669,7 +673,7 @@ var topicRemarkLabels = map[string]string{
 }
 
 func defaultTopicRemark(topic string) string {
-	norm := strings.Trim(normalizeTopic(topic), "/")
+	norm := strings.Trim(util.NormalizeTopic(topic), "/")
 	// 只有根节点本身才命名，避免未知子主题都被泛化成「规则引擎」。
 	if strings.EqualFold(norm, "ruleengine") {
 		return "规则引擎"
@@ -769,7 +773,7 @@ func (s *Store) UpsertTopicRemarks(cameraID int64, items []TopicRemarkInput) err
 	defer stmt.Close()
 	ts := now()
 	for _, item := range items {
-		topic := normalizeTopic(item.Topic)
+		topic := util.NormalizeTopic(item.Topic)
 		if topic == "" {
 			continue
 		}
@@ -801,7 +805,7 @@ func (s *Store) ListTopicRemarks() (map[int64]map[string]string, error) {
 		if out[id] == nil {
 			out[id] = map[string]string{}
 		}
-		out[id][normalizeTopic(topic)] = remark
+		out[id][util.NormalizeTopic(topic)] = remark
 	}
 	return out, rows.Err()
 }

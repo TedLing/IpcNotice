@@ -15,30 +15,32 @@ cd ..
 
 echo [2/2] Compiling backend (cross-platform, CGO_ENABLED=0) ...
 set CGO_ENABLED=0
+if not exist dist mkdir dist
 
-echo   - windows/amd64 -> ipcnotice.exe
+echo   - windows/amd64 -^> dist\ipcnotice.exe
 set GOOS=windows
 set GOARCH=amd64
-go build -o ipcnotice.exe .
+go build -o dist\ipcnotice.exe .
 if errorlevel 1 goto :fail
 
-echo   - linux/amd64   -> ipcnotice-linux-amd64
+echo   - linux/amd64   -^> dist\ipcnotice-linux-amd64
 set GOOS=linux
 set GOARCH=amd64
-go build -o ipcnotice-linux-amd64 .
+go build -o dist\ipcnotice-linux-amd64 .
 if errorlevel 1 goto :fail
 
-echo   - linux/arm64   -> ipcnotice-linux-arm64
+echo   - linux/arm64   -^> dist\ipcnotice-linux-arm64
 set GOOS=linux
 set GOARCH=arm64
-go build -o ipcnotice-linux-arm64 .
+go build -o dist\ipcnotice-linux-arm64 .
 if errorlevel 1 goto :fail
 
 echo.
-echo Done. 前端已内嵌进二进制（单文件部署，无需 web/dist）：
-echo   ipcnotice.exe            (windows/amd64)
-echo   ipcnotice-linux-amd64    (linux/amd64)
-echo   ipcnotice-linux-arm64    (linux/arm64)
+echo Done. Frontend is embedded in the binaries (single-file deploy).
+echo Output in dist\ :
+echo   dist\ipcnotice.exe            (windows/amd64)
+echo   dist\ipcnotice-linux-amd64    (linux/amd64)
+echo   dist\ipcnotice-linux-arm64    (linux/arm64)
 goto :eof
 
 :fail

@@ -1,8 +1,9 @@
-package main
+// Package onvifcore 封装 ONVIF 客户端容错传输、Push 订阅接收端（NotifyServer）
+// 与单台摄像头的订阅生命周期管理（CameraWorker）。
+package onvifcore
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -16,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"IpcNotice/internal/config"
 	"github.com/mickeyzzc/onvif-go/v2/onvif"
 )
 
@@ -48,27 +50,27 @@ func (c *deviceCounter) mark(ip string) {
 // 注意：TP-Link 固件无法正确处理 percent-encoded 的中文路径（会把回调地址损坏成乱码），
 // 因此路径段一律使用 ASCII 的设备 token（c<id>），设备名仅用于显示与日志。
 type NotifyServer struct {
-	cfg      ServerConfig
+	cfg      config.ServerConfig
 	baseURL  string
 	mux      *http.ServeMux
 	server   *http.Server
 	mu       sync.RWMutex
-	devices  map[string]*DeviceConfig // token 与历史名称路径双键 → 设备
-	counters sync.Map                 // name -> *deviceCounter
-	onEvent  func(*DeviceConfig, []onvif.NotificationMessage)
+	devices  map[string]*config.DeviceConfig // token 与历史名称路径双键 → 设备
+	counters sync.Map                        // name -> *deviceCounter
+	onEvent  func(*config.DeviceConfig, []onvif.NotificationMessage)
 	log      *slog.Logger
 }
 
 // notifyToken 返回 ASCII 安全的回调路径段。
-func notifyToken(d *DeviceConfig) string {
+func notifyToken(d *config.DeviceConfig) string {
 	if d.ID > 0 {
 		return fmt.Sprintf("c%d", d.ID)
 	}
 	return url.PathEscape(d.Name)
 }
 
-func deviceKeyMap(devices []*DeviceConfig) map[string]*DeviceConfig {
-	m := make(map[string]*DeviceConfig, len(devices)*2)
+func deviceKeyMap(devices []*config.DeviceConfig) map[string]*config.DeviceConfig {
+	m := make(map[string]*config.DeviceConfig, len(devices)*2)
 	for _, d := range devices {
 		m[notifyToken(d)] = d
 		if _, exists := m[d.Name]; !exists {
@@ -79,8 +81,8 @@ func deviceKeyMap(devices []*DeviceConfig) map[string]*DeviceConfig {
 }
 
 // NewNotifyServer 构造接收端。baseURL 的 host 必须是摄像头可路由到的地址。
-func NewNotifyServer(cfg ServerConfig, advertiseHost string, devices []*DeviceConfig,
-	onEvent func(*DeviceConfig, []onvif.NotificationMessage), logger *slog.Logger) (*NotifyServer, error) {
+func NewNotifyServer(cfg config.ServerConfig, advertiseHost string, devices []*config.DeviceConfig,
+	onEvent func(*config.DeviceConfig, []onvif.NotificationMessage), logger *slog.Logger) (*NotifyServer, error) {
 
 	_, port, err := net.SplitHostPort(cfg.ListenAddr)
 	if err != nil {
@@ -145,7 +147,7 @@ func (n *NotifyServer) BaseURL() string {
 
 // SetDevices 在配置变更后替换设备表，使新增/重命名的摄像头无需重启即可回调。
 // 设备改名后 token（c<id>）不变，回调地址保持稳定；同时保留名称键兼容在途的旧订阅。
-func (n *NotifyServer) SetDevices(devices []*DeviceConfig) {
+func (n *NotifyServer) SetDevices(devices []*config.DeviceConfig) {
 	fresh := deviceKeyMap(devices)
 	n.mu.Lock()
 	n.devices = fresh
@@ -156,7 +158,7 @@ func (n *NotifyServer) SetDevices(devices []*DeviceConfig) {
 	n.log.Debug("Notify 设备表已更新", "count", len(devices))
 }
 
-func (n *NotifyServer) getDevice(name string) *DeviceConfig {
+func (n *NotifyServer) getDevice(name string) *config.DeviceConfig {
 	n.mu.RLock()
 	defer n.mu.RUnlock()
 	return n.devices[name]
@@ -186,7 +188,7 @@ func (n *NotifyServer) Shutdown(ctx context.Context) error {
 }
 
 // ConsumerURL 返回某台设备专用的回调地址（ASCII token 路径，改名不影响）。
-func (n *NotifyServer) ConsumerURL(dev *DeviceConfig) string {
+func (n *NotifyServer) ConsumerURL(dev *config.DeviceConfig) string {
 	return n.BaseURL() + "/" + notifyToken(dev)
 }
 
@@ -318,7 +320,7 @@ func isLocalAddr(host string) bool {
 	return false
 }
 
-// deviceNameFromCounter 仅用于日志汇总，避免暴露额外状态。
+// PostCounts 返回各设备的 Notify 接收计数（按名称统计，便于运行态展示）。
 func (n *NotifyServer) PostCounts() map[string]string {
 	out := make(map[string]string)
 	n.counters.Range(func(k, v any) bool {
@@ -327,13 +329,4 @@ func (n *NotifyServer) PostCounts() map[string]string {
 		return true
 	})
 	return out
-}
-
-// jsonDump 用于调试输出结构化对象。
-func jsonDump(v any) string {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return fmt.Sprintf("%v", v)
-	}
-	return string(b)
 }

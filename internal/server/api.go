@@ -1,11 +1,10 @@
-package main
+// Package server 提供管理界面所需的 REST API 与前端静态资源托管。
+package server
 
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
 	"crypto/subtle"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,6 +22,14 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"IpcNotice/internal/config"
+	"IpcNotice/internal/dispatch"
+	"IpcNotice/internal/manager"
+	"IpcNotice/internal/preview"
+	"IpcNotice/internal/probe"
+	"IpcNotice/internal/store"
+	"IpcNotice/internal/util"
 )
 
 const sessionCookie = "ipcnotice_session"
@@ -30,29 +37,33 @@ const sessionTTL = 24 * time.Hour
 
 // APIServer 提供管理界面所需的 REST API 与前端静态资源。
 type APIServer struct {
-	cfg        *Config
-	store      *Store
-	mgr        *Manager
+	cfg        *config.Config
+	store      *store.Store
+	mgr        *manager.Manager
 	log        *slog.Logger
 	distFS     fs.FS // 前端资源：默认内嵌（embed），可用 -web-dir 覆盖为磁盘目录
 	distSource string // 日志用：embedded / dir:xxx
+	version    string
 	mux        *http.ServeMux
 	server     *http.Server
 
-	preview *previewHub // WebRTC 预览会话（RTSP → WebRTC 中继）
+	preview *preview.Hub // WebRTC 预览会话（RTSP → WebRTC 中继）
 
 	sessMu   sync.Mutex
 	sessions map[string]time.Time
 }
 
-func NewAPIServer(cfg *Config, store *Store, mgr *Manager, webDir string, logger *slog.Logger) *APIServer {
+// NewAPIServer 构造管理服务。webFS 为编译期内嵌的前端资源根（含 web/dist 子目录）；
+// webDir 非空且存在时优先使用磁盘目录。version 注入自 main 包（构建时 -X 可覆盖）。
+func NewAPIServer(cfg *config.Config, store *store.Store, mgr *manager.Manager,
+	webFS fs.FS, webDir, version string, logger *slog.Logger) *APIServer {
 	s := &APIServer{
-		cfg: cfg, store: store, mgr: mgr,
+		cfg: cfg, store: store, mgr: mgr, version: version,
 		log: logger.With("component", "api"),
 		mux: http.NewServeMux(), sessions: map[string]time.Time{},
-		preview: newPreviewHub(logger),
+		preview: preview.NewHub(logger),
 	}
-	s.distFS, s.distSource = resolveWebFS(webDir)
+	s.distFS, s.distSource = resolveWebFS(webFS, webDir)
 	s.routes()
 	s.server = &http.Server{
 		Addr:              cfg.Addr(),
@@ -64,7 +75,7 @@ func NewAPIServer(cfg *Config, store *Store, mgr *Manager, webDir string, logger
 
 func (s *APIServer) routes() {
 	s.mux.HandleFunc("GET /api/health", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "version": version})
+		writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "version": s.version})
 	})
 	s.mux.HandleFunc("POST /api/login", s.login)
 	s.mux.HandleFunc("POST /api/refresh-token", s.refreshToken)
@@ -106,6 +117,7 @@ func (s *APIServer) routes() {
 	s.mux.HandleFunc("/", s.serveStatic)
 }
 
+// Start 开始监听管理端口（非阻塞）。
 func (s *APIServer) Start() error {
 	ln, err := net.Listen("tcp", s.cfg.Addr())
 	if err != nil {
@@ -121,9 +133,10 @@ func (s *APIServer) Start() error {
 	return nil
 }
 
+// Shutdown 先释放所有预览会话，再关闭 HTTP 服务。
 func (s *APIServer) Shutdown(ctx context.Context) error {
 	// 先释放所有预览的 RTSP 连接与 WebRTC 端口，再关闭 HTTP 服务。
-	s.preview.closeAll()
+	s.preview.CloseAll()
 	return s.server.Shutdown(ctx)
 }
 
@@ -145,7 +158,7 @@ func (s *APIServer) login(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusUnauthorized, "用户名或密码错误")
 		return
 	}
-	token := randomToken()
+	token := util.RandomToken()
 	s.sessMu.Lock()
 	now := time.Now()
 	for k, exp := range s.sessions {
@@ -182,7 +195,7 @@ func (s *APIServer) refreshToken(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusUnauthorized, "会话已过期，请重新登录")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"success": true, "data": s.userData(randomToken())})
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "data": s.userData(util.RandomToken())})
 }
 
 func (s *APIServer) logout(w http.ResponseWriter, r *http.Request) {
@@ -227,14 +240,6 @@ func (s *APIServer) auth(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-func randomToken() string {
-	b := make([]byte, 32)
-	if _, err := rand.Read(b); err != nil {
-		return strconv.FormatInt(time.Now().UnixNano(), 16)
-	}
-	return hex.EncodeToString(b)
-}
-
 // ---------------- settings ----------------
 
 func (s *APIServer) getSettings(w http.ResponseWriter, _ *http.Request) {
@@ -247,7 +252,7 @@ func (s *APIServer) getSettings(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *APIServer) putSettings(w http.ResponseWriter, r *http.Request) {
-	var st Settings
+	var st config.Settings
 	if err := readJSON(r, &st); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
@@ -256,7 +261,7 @@ func (s *APIServer) putSettings(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	old := s.mgr.settings()
+	old := s.mgr.Settings()
 	if err := s.store.SaveSettings(st); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
@@ -285,7 +290,7 @@ func (s *APIServer) listCameras(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *APIServer) createCamera(w http.ResponseWriter, r *http.Request) {
-	var c Camera
+	var c store.Camera
 	if err := readJSON(r, &c); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
@@ -334,18 +339,18 @@ func (s *APIServer) deleteCamera(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"success": true})
 }
 
-func (s *APIServer) cameraFromRequest(r *http.Request) (Camera, error) {
+func (s *APIServer) cameraFromRequest(r *http.Request) (store.Camera, error) {
 	id, err := pathID(r)
 	if err != nil {
-		return Camera{}, err
+		return store.Camera{}, err
 	}
 	old, err := s.store.GetCamera(id)
 	if err != nil {
-		return Camera{}, fmt.Errorf("设备不存在: %w", err)
+		return store.Camera{}, fmt.Errorf("设备不存在: %w", err)
 	}
-	var body Camera
+	var body store.Camera
 	if err := readJSON(r, &body); err != nil {
-		return Camera{}, err
+		return store.Camera{}, err
 	}
 	body.ID = id
 	body.CreatedAt = old.CreatedAt
@@ -366,10 +371,10 @@ func (s *APIServer) testCamera(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	res, err := testDevice(r.Context(), dev, s.log, 0)
+	res, err := probe.TestDevice(r.Context(), dev, s.log, 0)
 	if err != nil {
 		_ = s.store.UpdateCameraTest(c.ID, false, err.Error(), "", "", "", "")
-		writeJSON(w, http.StatusOK, DeviceTestResult{OK: false, Message: err.Error(),
+		writeJSON(w, http.StatusOK, probe.DeviceTestResult{OK: false, Message: err.Error(),
 			Topics: []string{}, ObservedTopics: []string{}, Warnings: []string{}})
 		return
 	}
@@ -388,7 +393,7 @@ func (s *APIServer) cameraDeviceInfo(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 120*time.Second)
 	defer cancel()
-	res := collectDeviceInfo(ctx, dev, s.log)
+	res := probe.CollectDeviceInfo(ctx, dev, s.log)
 	writeJSON(w, http.StatusOK, res)
 }
 
@@ -410,7 +415,7 @@ func (s *APIServer) discoverCamera(w http.ResponseWriter, r *http.Request) {
 		body.CaptureSeconds = 30
 	}
 
-	res, err := testDevice(r.Context(), dev, s.log, body.CaptureSeconds)
+	res, err := probe.TestDevice(r.Context(), dev, s.log, body.CaptureSeconds)
 	if err != nil {
 		_ = s.store.UpdateCameraTest(c.ID, false, err.Error(), "", "", "", "")
 		writeErr(w, http.StatusBadRequest, err.Error())
@@ -463,7 +468,7 @@ func (s *APIServer) saveTopicRemarks(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Items []TopicRemarkInput `json:"items"`
+		Items []store.TopicRemarkInput `json:"items"`
 	}
 	if err := readJSON(r, &body); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
@@ -482,20 +487,97 @@ func (s *APIServer) saveTopicRemarks(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, topics)
 }
 
-func (s *APIServer) cameraDevice(r *http.Request) (Camera, *DeviceConfig, error) {
+func (s *APIServer) cameraDevice(r *http.Request) (store.Camera, *config.DeviceConfig, error) {
 	id, err := pathID(r)
 	if err != nil {
-		return Camera{}, nil, err
+		return store.Camera{}, nil, err
 	}
 	c, err := s.store.GetCamera(id)
 	if err != nil {
-		return Camera{}, nil, fmt.Errorf("设备不存在: %w", err)
+		return store.Camera{}, nil, fmt.Errorf("设备不存在: %w", err)
 	}
 	dev, err := c.Device()
 	if err != nil {
-		return Camera{}, nil, fmt.Errorf("设备配置非法: %w", err)
+		return store.Camera{}, nil, fmt.Errorf("设备配置非法: %w", err)
 	}
 	return c, dev, nil
+}
+
+// ---------------- WebRTC 预览信令 ----------------
+
+// previewOffer 接收浏览器 SDP offer，返回 answer 与会话 ID（非 trickle ICE，answer 内含全部候选）。
+func (s *APIServer) previewOffer(w http.ResponseWriter, r *http.Request) {
+	_, dev, err := s.cameraDevice(r)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	var body struct {
+		SDP string `json:"sdp"`
+	}
+	if err := readJSON(r, &body); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// 注意：不能用 strings.TrimSpace 整段处理 SDP。浏览器 offer 本以 \r\n 结尾，
+	// TrimSpace 会一并裁掉结尾换行，导致 pion 解析最后一行属性时返回 io.EOF（与 H.264 无关）。
+	// 这里只去掉首尾空白字符，并保证末尾有一个换行以满足 pion 的解析要求。
+	sdp := strings.Trim(body.SDP, " \t\r\n")
+	if sdp == "" || len(sdp) > preview.OfferLimit {
+		writeErr(w, http.StatusBadRequest, "缺少合法的 sdp offer")
+		return
+	}
+	if !strings.HasSuffix(sdp, "\n") {
+		sdp += "\n"
+	}
+	body.SDP = sdp
+
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	src, err := preview.OpenSource(ctx, dev, s.log)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			src.Close()
+		}
+	}()
+
+	sess, answer, err := s.preview.Start(ctx, dev, body.SDP, src)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	if err := s.preview.Add(sess); err != nil {
+		sess.Close()
+		writeErr(w, http.StatusTooManyRequests, err.Error())
+		return
+	}
+	committed = true
+	writeJSON(w, http.StatusOK, map[string]any{
+		"session": sess.ID(),
+		"sdp":     answer,
+		"codec":   "H.264",
+		"profile": src.Profile(),
+		"stream":  src.StreamURL(),
+	})
+}
+
+// previewClose 前端关闭弹窗时主动释放会话（ICE 状态变化也会自动回收，这里是快速路径）。
+func (s *APIServer) previewClose(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	session := r.PathValue("session")
+	if session != "" {
+		s.preview.RemoveIf(session, id)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 // ---------------- subscriptions ----------------
@@ -535,8 +617,8 @@ func (s *APIServer) saveSubscriptions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Items   []SubscriptionInput `json:"items"`
-		Remarks []TopicRemarkInput  `json:"remarks"`
+		Items   []store.SubscriptionInput `json:"items"`
+		Remarks []store.TopicRemarkInput   `json:"remarks"`
 	}
 	if err := readJSON(r, &body); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
@@ -571,7 +653,7 @@ func (s *APIServer) listChannels(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *APIServer) createChannel(w http.ResponseWriter, r *http.Request) {
-	var c WebhookChannel
+	var c store.WebhookChannel
 	if err := readJSON(r, &c); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
@@ -599,7 +681,7 @@ func (s *APIServer) updateChannel(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "通道不存在")
 		return
 	}
-	var c WebhookChannel
+	var c store.WebhookChannel
 	if err := readJSON(r, &c); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
@@ -633,12 +715,12 @@ func (s *APIServer) deleteChannel(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"success": true})
 }
 
-func validateChannel(c *WebhookChannel) error {
+func validateChannel(c *store.WebhookChannel) error {
 	c.Name = strings.TrimSpace(c.Name)
 	// 通道仅支持 POST
 	c.Method = http.MethodPost
 	c.BodyTemplate = strings.TrimSpace(c.BodyTemplate)
-	if !validBodyTemplate(c.BodyTemplate) {
+	if !dispatch.ValidBodyTemplate(c.BodyTemplate) {
 		return errors.New("请求体模板不是合法 JSON（占位符仅支持 {title} / {content}，且需写在字符串值内）")
 	}
 	u, err := url.Parse(c.URL)
@@ -663,8 +745,8 @@ func (s *APIServer) testChannel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 用一条与真实推送同构的示例事件渲染请求体，让「测试推送」所见即所得。
-	evt := Event{
-		ID:         "test-" + randomToken()[:8],
+	evt := dispatch.Event{
+		ID:         "test-" + util.RandomToken()[:8],
 		Device:     "测试摄像头",
 		Transport:  "test",
 		Topic:      "RuleEngine/CellMotionDetector/Motion",
@@ -674,7 +756,7 @@ func (s *APIServer) testChannel(w http.ResponseWriter, r *http.Request) {
 	}
 	var body []byte
 	if strings.TrimSpace(ch.BodyTemplate) != "" {
-		body = []byte(renderBodyTemplate(ch.BodyTemplate, evt))
+		body = []byte(dispatch.RenderBodyTemplate(ch.BodyTemplate, evt))
 	} else {
 		body, _ = json.Marshal(evt)
 	}
@@ -759,8 +841,8 @@ func (s *APIServer) reloadQuiet() {
 // ---------------- static ----------------
 
 // resolveWebFS 选择前端资源来源：若显式指定 -web-dir 且目录存在，则使用磁盘目录；
-// 否则使用编译期内嵌的 web/dist（单文件部署）。
-func resolveWebFS(webDir string) (fsys fs.FS, source string) {
+// 否则使用编译期内嵌的 web/dist（单文件部署）。webFS 应为包含 web/dist 的根文件系统。
+func resolveWebFS(webFS fs.FS, webDir string) (fsys fs.FS, source string) {
 	if webDir != "" {
 		if info, err := os.Stat(webDir); err == nil && info.IsDir() {
 			return os.DirFS(webDir), "dir:" + webDir

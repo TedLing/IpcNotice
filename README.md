@@ -65,7 +65,7 @@ flowchart LR
   DISP --> HOOK["Webhook 通道<br/>异步队列"]
   UI["Web 管理界面 :8080"] <-->|"/api REST"| APP
   UI -->|"配置 / 订阅 / 查询"| DB
-  CAM -->|"RTSP H.264（仅预览时）"| PREVIEW["preview.go<br/>WebRTC 中继"]
+  CAM -->|"RTSP H.264（仅预览时）"| PREVIEW["internal/preview<br/>WebRTC 中继"]
   PREVIEW -->|"WebRTC / DTLS-SRTP"| UI
 ```
 
@@ -118,6 +118,8 @@ go build -o ipcnotice .          # Windows 下可用 -o ipcnotice.exe
 # 3) 启动
 ./ipcnotice                      # 默认端口 8080
 ```
+
+Windows 下可直接运行根目录的 `builder.bat`：先构建前端，再以 `CGO_ENABLED=0` 交叉编译三平台（`windows/amd64`、`linux/amd64`、`linux/arm64`），产物统一输出到外层 `dist/` 目录。
 
 浏览器打开 <http://127.0.0.1:8080>，使用 `config.json` 中的账号密码登录。
 
@@ -270,7 +272,7 @@ curl -b cookie.txt http://127.0.0.1:8080/api/runtime
 
 项目面向标准 ONVIF Event 设备，并针对部分固件的实际行为做了兼容处理：
 
-- **非法 XML**：某些设备 `GetEventProperties` 返回未加引号的属性，`transport.go` 在 SOAP 解析前修正。
+- **非法 XML**：某些设备 `GetEventProperties` 返回未加引号的属性，`internal/onvifcore/transport.go` 在 SOAP 解析前修正。
 - **主题声明与实际推送不一致**：实际事件可能落在与 TopicSet 声明树不同的路径下，统一走主题归一化后比对，不做严格树状过滤。
 - **回调路径必须为 ASCII**：部分固件无法正确处理 percent-encoded 的中文路径，因此回调路径使用 `c<camera-id>` token，设备名只用于显示；token 由数据库自增 ID 推导，改名不会使订阅失效。
 - **设备不遵守订阅 TTL**：进程异常退出可能残留订阅占用设备订阅槽。程序会把订阅管理地址持久化，下次建立订阅前尽力退订残留订阅；若设备端订阅槽已耗尽（表现为新订阅成功但零回调），需要给摄像头断电重启彻底清理。
@@ -310,8 +312,20 @@ IpcNotice/
 ├── config.example.json    # 配置样例（无真实凭据）
 ├── config.json            # 仅 username / password / port（含凭据，已忽略）
 ├── go.mod / go.sum
-├── *.go                   # Go 后端
+├── main.go / embed.go     # 入口组装与前端内嵌（embed 要求放在仓库根）
+├── internal/              # Go 后端（按职责分包）
+│   ├── config/            # 配置模型（config.json + 运行期 Settings）
+│   ├── store/             # SQLite 数据层与旧版配置迁移
+│   ├── util/              # 共享叶子函数（主题归一化/匹配等）
+│   ├── onvifcore/         # ONVIF 客户端、Notify 接收端、订阅 worker
+│   ├── dispatch/          # 事件信封、去重、落库与 webhook 路由推送
+│   ├── manager/           # 运行时编排与热重载（实现 onvifcore.WorkerHost）
+│   ├── probe/             # 设备连通性测试与 ONVIF 信息聚合
+│   ├── preview/           # WebRTC 视频预览中继（RTSP → WebRTC）
+│   └── server/            # REST API 与前端静态托管
+├── builder.bat            # 一键构建（前端 + 三平台交叉编译，产物在 dist/）
 ├── .github/workflows/     # GitHub Actions 编译发版
+├── dist/                  # 本地编译产物（已忽略）
 ├── data/                  # SQLite（运行时生成，已忽略）
 ├── logs/                  # 运行日志与 events.jsonl（已忽略）
 └── web/
@@ -322,7 +336,7 @@ IpcNotice/
     └── dist/              # 前端构建产物，编译期由 Go 通过 embed 内嵌进二进制
 ```
 
-主要模块：`main.go` 启动与优雅退出、`config.go` 配置模型、`store.go` 数据库、`runtime.go` 热重载、`listen.go` 订阅生命周期、`notify.go` 回调接收、`dispatch.go` 去重与推送、`probe.go` 设备探测、`preview.go` WebRTC 预览中继、`api.go` REST 接口、`transport.go` SOAP 响应修正。
+主要模块：`internal/config` 配置模型、`internal/store` 数据库、`internal/manager` 热重载、`internal/onvifcore` 订阅生命周期与回调接收（`listen.go`/`notify.go`/`transport.go`）、`internal/dispatch` 去重与推送、`internal/probe` 设备探测、`internal/preview` WebRTC 预览中继、`internal/server` REST 接口。
 
 ## 许可证
 

@@ -1,4 +1,5 @@
-package main
+// Package dispatch 负责事件信封构造、去重、落库与按订阅路由异步推送到 webhook 通道。
+package dispatch
 
 import (
 	"bytes"
@@ -16,6 +17,9 @@ import (
 	"time"
 	_ "time/tzdata" // 内嵌时区数据库，保证交叉编译/精简容器下 LoadLocation("Asia/Shanghai") 可用
 
+	"IpcNotice/internal/config"
+	"IpcNotice/internal/store"
+	"IpcNotice/internal/util"
 	"github.com/mickeyzzc/onvif-go/v2/events"
 	"github.com/mickeyzzc/onvif-go/v2/onvif"
 	"github.com/mickeyzzc/onvif-go/v2/types"
@@ -42,6 +46,7 @@ type Event struct {
 	Data       map[string]string `json:"data,omitempty"`
 }
 
+// MotionPayload 是移动侦测结构化数据（如带置信度）。
 type MotionPayload struct {
 	Active bool    `json:"active"`
 	Score  float64 `json:"score,omitempty"`
@@ -50,7 +55,7 @@ type MotionPayload struct {
 
 var eventSeq atomic.Uint64
 
-func buildEvent(dev *DeviceConfig, transport string, msg onvif.NotificationMessage) Event {
+func buildEvent(dev *config.DeviceConfig, transport string, msg onvif.NotificationMessage) Event {
 	t := msg.Message.UtcTime
 	if t.IsZero() {
 		t = time.Now().UTC()
@@ -88,7 +93,7 @@ func itemsToMap(items []types.SimpleItem) map[string]string {
 // Route 是「某主题 → 若干通知渠道」的一条路由。
 type Route struct {
 	Topic    string
-	Channels []WebhookChannel
+	Channels []store.WebhookChannel
 }
 
 // RouteTable 是运行期由数据库订阅配置生成的一份只读快照。
@@ -99,7 +104,8 @@ type RouteTable struct {
 	Remarks   map[string]map[string]string
 }
 
-func emptyRouteTable() *RouteTable {
+// EmptyRouteTable 返回一张空的路由表。
+func EmptyRouteTable() *RouteTable {
 	return &RouteTable{
 		ByCamera:  map[string][]Route{},
 		CameraIDs: map[string]int64{},
@@ -107,10 +113,10 @@ func emptyRouteTable() *RouteTable {
 	}
 }
 
-// lookupTitle 返回事件标题与原始备注。匹配顺序：精确主题 → 最长通配/前缀主题 →
+// LookupTitle 返回事件标题与原始备注。匹配顺序：精确主题 → 最长通配/前缀主题 →
 // 主题最后一段。这样即使订阅用了 /* 通配，也能带上该行填写的中文名称。
-func (rt *RouteTable) lookupTitle(device, topic string) (string, string) {
-	norm := normalizeTopic(topic)
+func (rt *RouteTable) LookupTitle(device, topic string) (string, string) {
+	norm := util.NormalizeTopic(topic)
 	remarks := map[string]string{}
 	if rt != nil {
 		remarks = rt.Remarks[device]
@@ -120,7 +126,7 @@ func (rt *RouteTable) lookupTitle(device, topic string) (string, string) {
 	}
 	best, bestLen := "", -1
 	for pattern, r := range remarks {
-		if r == "" || !matchTopic(pattern, norm) {
+		if r == "" || !util.MatchTopic(pattern, norm) {
 			continue
 		}
 		if len(pattern) > bestLen {
@@ -138,16 +144,16 @@ func (rt *RouteTable) lookupTitle(device, topic string) (string, string) {
 	return fallback, ""
 }
 
-func (rt *RouteTable) match(device, topic string) (bool, []WebhookChannel, string) {
+func (rt *RouteTable) match(device, topic string) (bool, []store.WebhookChannel, string) {
 	if rt == nil {
 		return false, nil, ""
 	}
-	var picked []WebhookChannel
+	var picked []store.WebhookChannel
 	seen := map[int64]bool{}
 	names := []string{}
 	topicMatched := false
 	for _, r := range rt.ByCamera[device] {
-		if !matchTopic(r.Topic, topic) {
+		if !util.MatchTopic(r.Topic, topic) {
 			continue
 		}
 		topicMatched = true
@@ -166,7 +172,7 @@ func (rt *RouteTable) match(device, topic string) (bool, []WebhookChannel, strin
 // Dispatcher 把事件记录到日志 / JSONL / SQLite，并按订阅路由异步推送到 webhook 通道。
 // ONVIF 的 handler 只做入队，绝不阻塞订阅轮询循环。
 type Dispatcher struct {
-	store  *Store
+	store  *store.Store
 	client *http.Client
 	queue  chan Event
 	wg     sync.WaitGroup
@@ -194,7 +200,7 @@ type dedupState struct {
 	expiresAt time.Time
 }
 
-func NewDispatcher(store *Store, st Settings, logger *slog.Logger) (*Dispatcher, error) {
+func NewDispatcher(store *store.Store, st config.Settings, logger *slog.Logger) (*Dispatcher, error) {
 	d := &Dispatcher{
 		store:        store,
 		client:       &http.Client{Timeout: time.Duration(st.WebhookTimeoutSeconds) * time.Second},
@@ -204,7 +210,7 @@ func NewDispatcher(store *Store, st Settings, logger *slog.Logger) (*Dispatcher,
 		maxEventLogs: st.MaxEventLogs,
 		seen:         make(map[string]dedupState),
 	}
-	d.routes.Store(emptyRouteTable())
+	d.routes.Store(EmptyRouteTable())
 	if err := d.configure(st, false); err != nil {
 		return nil, err
 	}
@@ -216,11 +222,11 @@ func NewDispatcher(store *Store, st Settings, logger *slog.Logger) (*Dispatcher,
 }
 
 // Configure 在「系统设置」变更后热更新去重窗口、事件文件与日志上限。
-func (d *Dispatcher) Configure(st Settings) error {
+func (d *Dispatcher) Configure(st config.Settings) error {
 	return d.configure(st, true)
 }
 
-func (d *Dispatcher) configure(st Settings, reopen bool) error {
+func (d *Dispatcher) configure(st config.Settings, reopen bool) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.dedupTTL = time.Duration(st.DedupSeconds) * time.Second
@@ -252,18 +258,31 @@ func (d *Dispatcher) configure(st Settings, reopen bool) error {
 // SetRoutes 原子替换路由表，由 Manager.Reload 调用。
 func (d *Dispatcher) SetRoutes(rt *RouteTable) {
 	if rt == nil {
-		rt = emptyRouteTable()
+		rt = EmptyRouteTable()
 	}
 	d.routes.Store(rt)
 }
 
+// RouteCount 返回当前生效的订阅路由条数（供运行态展示）。
+func (d *Dispatcher) RouteCount() int {
+	rt := d.routes.Load()
+	if rt == nil {
+		return 0
+	}
+	n := 0
+	for _, rs := range rt.ByCamera {
+		n += len(rs)
+	}
+	return n
+}
+
 // Submit 入队一批事件；队列满时丢弃并记录，避免拖垮订阅循环。
-func (d *Dispatcher) Submit(dev *DeviceConfig, transport string, msgs []onvif.NotificationMessage) {
+func (d *Dispatcher) Submit(dev *config.DeviceConfig, transport string, msgs []onvif.NotificationMessage) {
 	for _, msg := range msgs {
 		evt := buildEvent(dev, transport, msg)
 		if d.isDuplicate(evt) {
 			d.log.Debug("去重：跳过重复状态", "device", dev.Name, "topic", evt.Topic,
-				"device_time", evt.DeviceTime, "data", jsonDump(evt.Data))
+				"device_time", evt.DeviceTime, "data", util.JSONDump(evt.Data))
 			continue
 		}
 		evt.ID = fmt.Sprintf("%d-%06d", time.Now().UnixNano(), eventSeq.Add(1))
@@ -283,14 +302,6 @@ func (d *Dispatcher) Submit(dev *DeviceConfig, transport string, msgs []onvif.No
 
 // isDuplicate 按「设备 + 主题 + 操作 + 来源」记住最近一次的状态值，在 TTL 内抑制
 // 同一状态的重复推送；状态值一旦变化立即放行并刷新记录。
-//
-// 设计要点：
-//   - 故意不含 device_time：TP-Link 的 PullPoint 每秒重发一次 Motion=true 且带新
-//     时间戳的心跳，按时间戳去重等于没去重。
-//   - 键不含 data、data 参与值比较：保证 事件开始(true)→结束(false)→再次触发(true)
-//     的完整序列不被误杀，真实连续触发可以到达下游。
-//   - 多个旧订阅实例向同一 token 推送同一状态时，只有第一份会通过，其余在 TTL
-//     内被抑制——token 稳定性带来的重复订阅不会产生重复推送。
 func (d *Dispatcher) isDuplicate(evt Event) bool {
 	d.mu.RLock()
 	ttl := d.dedupTTL
@@ -299,10 +310,10 @@ func (d *Dispatcher) isDuplicate(evt Event) bool {
 		return false
 	}
 	key := strings.Join([]string{
-		evt.Device, normalizeTopic(evt.Topic), evt.Operation, jsonDump(evt.Source),
+		evt.Device, util.NormalizeTopic(evt.Topic), evt.Operation, util.JSONDump(evt.Source),
 	}, "\x00")
-	data := jsonDump(evt.Data)
-	source := jsonDump(evt.Source)
+	data := util.JSONDump(evt.Data)
+	source := util.JSONDump(evt.Source)
 
 	d.seenMu.Lock()
 	defer d.seenMu.Unlock()
@@ -332,15 +343,15 @@ func (d *Dispatcher) handle(evt Event) {
 	rt := d.routes.Load()
 	matched, channels, channelNames := rt.match(evt.Device, evt.Topic)
 	// 在写 JSONL / SQLite / webhook 之前补上标题，保证三处内容与 HTTP body 完全一致。
-	evt.Title, evt.Remark = rt.lookupTitle(evt.Device, evt.Topic)
+	evt.Title, evt.Remark = rt.LookupTitle(evt.Device, evt.Topic)
 	cameraID := int64(0)
 	if rt != nil {
 		cameraID = rt.CameraIDs[evt.Device]
 	}
 
 	// 记录运行期真实出现的主题（TP-Link 的实际主题常不在 TopicSet 声明树里）。
-	if cameraID > 0 && normalizeTopic(evt.Topic) != "" {
-		if _, err := d.store.UpsertObservedTopic(cameraID, normalizeTopic(evt.Topic)); err != nil {
+	if cameraID > 0 && util.NormalizeTopic(evt.Topic) != "" {
+		if _, err := d.store.UpsertObservedTopic(cameraID, util.NormalizeTopic(evt.Topic)); err != nil {
 			d.log.Warn("记录观察到的事件主题失败", "err", err)
 		}
 	}
@@ -356,7 +367,7 @@ func (d *Dispatcher) handle(evt Event) {
 		"device", evt.Device, "transport", evt.Transport, "topic", evt.Topic,
 		"title", evt.Title,
 		"operation", evt.Operation, "device_time", evt.DeviceTime,
-		"data", jsonDump(evt.Data), "motion", jsonDump(evt.Motion),
+		"data", util.JSONDump(evt.Data), "motion", util.JSONDump(evt.Motion),
 		"matched", matched, "channels", channelNames)
 
 	payload, err := json.Marshal(evt)
@@ -373,9 +384,9 @@ func (d *Dispatcher) handle(evt Event) {
 		_, _ = f.Write(line)
 		d.mu.Unlock()
 	}
-	if err := d.store.InsertEventLog(EventLog{
+	if err := d.store.InsertEventLog(store.EventLog{
 		EventID: evt.ID, CameraID: cameraID, Device: evt.Device,
-		Topic: normalizeTopic(evt.Topic), Transport: evt.Transport,
+		Topic: util.NormalizeTopic(evt.Topic), Transport: evt.Transport,
 		Payload: payload, Matched: matched, Dispatched: dispatched,
 		Channels: channelNames, CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
 	}); err != nil {
@@ -385,10 +396,10 @@ func (d *Dispatcher) handle(evt Event) {
 	}
 }
 
-func (d *Dispatcher) postWebhook(evt Event, ch WebhookChannel) bool {
+func (d *Dispatcher) postWebhook(evt Event, ch store.WebhookChannel) bool {
 	var payload []byte
 	if strings.TrimSpace(ch.BodyTemplate) != "" {
-		payload = []byte(renderBodyTemplate(ch.BodyTemplate, evt))
+		payload = []byte(RenderBodyTemplate(ch.BodyTemplate, evt))
 	} else {
 		var err error
 		payload, err = json.Marshal(evt)
@@ -436,14 +447,14 @@ func (d *Dispatcher) postWebhook(evt Event, ch WebhookChannel) bool {
 	return true
 }
 
-// pushTitle 组装占位符 {title}：摄像头xxx 发生-xxxx事件名称。
-func pushTitle(evt Event) string {
+// PushTitle 组装占位符 {title}：摄像头xxx 发生-xxxx事件名称。
+func PushTitle(evt Event) string {
 	return fmt.Sprintf("摄像头%s 发生-%s", evt.Device, evt.Title)
 }
 
-// pushContent 组装占位符 {content}：摄像头名称 + 发生了什么事件 + 触发时间。
-func pushContent(evt Event) string {
-	return fmt.Sprintf("摄像头%s 发生了%s事件，触发时间 %s", evt.Device, evt.Title, formatEventTime(evt))
+// PushContent 组装占位符 {content}：摄像头名称 + 发生了什么事件 + 触发时间。
+func PushContent(evt Event) string {
+	return fmt.Sprintf("摄像头%s 发生了%s事件，触发时间 %s", evt.Device, evt.Title, FormatEventTime(evt))
 }
 
 // cst 是中国标准时间（UTC+8）。通知时间统一按此时区展示，避免依赖运行机器
@@ -456,9 +467,9 @@ var cst = func() *time.Location {
 	return loc
 }()
 
-// formatEventTime 优先设备时间，其次本机接收时间，都解析失败时原样返回。
+// FormatEventTime 优先设备时间，其次本机接收时间，都解析失败时原样返回。
 // 解析成功后固定按中国时区（UTC+8）展示，不随运行机器时区变化。
-func formatEventTime(evt Event) string {
+func FormatEventTime(evt Event) string {
 	for _, s := range []string{evt.DeviceTime, evt.ReceivedAt} {
 		if s == "" {
 			continue
@@ -471,16 +482,16 @@ func formatEventTime(evt Event) string {
 	return time.Now().In(cst).Format("2006-01-02 15:04:05")
 }
 
-// renderBodyTemplate 把请求体模板里的 {title} / {content} 占位符替换为实际内容。
+// RenderBodyTemplate 把请求体模板里的 {title} / {content} 占位符替换为实际内容。
 // 模板本身是 JSON 文本，占位符写在字符串值里；未出现占位符则原样输出。
-func renderBodyTemplate(tpl string, evt Event) string {
-	out := strings.ReplaceAll(tpl, "{title}", pushTitle(evt))
-	out = strings.ReplaceAll(out, "{content}", pushContent(evt))
+func RenderBodyTemplate(tpl string, evt Event) string {
+	out := strings.ReplaceAll(tpl, "{title}", PushTitle(evt))
+	out = strings.ReplaceAll(out, "{content}", PushContent(evt))
 	return out
 }
 
-// validBodyTemplate 校验模板（把占位符替换成普通文本后）是否为合法 JSON。
-func validBodyTemplate(tpl string) bool {
+// ValidBodyTemplate 校验模板（把占位符替换成普通文本后）是否为合法 JSON。
+func ValidBodyTemplate(tpl string) bool {
 	if strings.TrimSpace(tpl) == "" {
 		return true
 	}

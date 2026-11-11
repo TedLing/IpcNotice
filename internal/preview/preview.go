@@ -1,4 +1,10 @@
-package main
+// Package preview 实现 WebRTC 视频预览中继：
+// 浏览器 <--WebRTC/H.264--> IpcNotice <--RTSP/H.264--> 摄像头。
+// 不转码、不落盘、不入订阅链路；每个预览是独立会话，关闭弹窗即释放设备 RTSP 连接。
+//
+// 注意：TP-Link 这类设备主码流常为 H.265，而浏览器 WebRTC 普遍只支持 H.264，
+// 因此 OpenSource 会遍历所有 ONVIF Profile，自动挑第一个 H.264 码流（通常是子码流）。
+package preview
 
 import (
 	"context"
@@ -6,13 +12,15 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net/http"
 	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"IpcNotice/internal/config"
+	"IpcNotice/internal/onvifcore"
+	"IpcNotice/internal/util"
 	"github.com/bluenviron/gortsplib/v5"
 	"github.com/bluenviron/gortsplib/v5/pkg/base"
 	"github.com/bluenviron/gortsplib/v5/pkg/description"
@@ -21,24 +29,19 @@ import (
 	"github.com/pion/webrtc/v3"
 )
 
-// 预览用 WebRTC 中继：浏览器 <--WebRTC/H.264--> IpcNotice <--RTSP/H.264--> 摄像头。
-// 不转码、不落盘、不入订阅链路；每个预览是独立会话，关闭弹窗即释放设备 RTSP 连接。
-//
-// 注意：TP-Link 这类设备主码流常为 H.265，而浏览器 WebRTC 普遍只支持 H.264，
-// 因此 openPreviewSource 会遍历所有 ONVIF Profile，自动挑第一个 H.264 码流（通常是子码流）。
-
 const (
-	previewMaxSessions  = 6                // 全局并发预览上限，避免拉爆摄像头 RTSP 连接数
-	previewMaxPerCamera = 2                // 单台摄像头并发预览上限
-	previewMaxLifetime  = 30 * time.Minute // 会话兜底存活时间（前端异常未关闭时自动回收）
-	previewOfferLimit   = 64 << 10         // SDP 请求体上限
+	MaxSessions  = 6                // 全局并发预览上限，避免拉爆摄像头 RTSP 连接数
+	MaxPerCamera = 2                // 单台摄像头并发预览上限
+	MaxLifetime  = 30 * time.Minute // 会话兜底存活时间（前端异常未关闭时自动回收）
+	OfferLimit   = 64 << 10         // SDP 请求体上限
+
 	previewSetupTimeout = 10 * time.Second // 单次 RTSP DESCRIBE / SETUP 超时
 )
 
 // ---------------- RTSP 源 ----------------
 
-// previewSource 表示一条已 DESCRIBE + SETUP 视频轨、尚未 PLAY 的 RTSP 连接。
-type previewSource struct {
+// Source 表示一条已 DESCRIBE + SETUP 视频轨、尚未 PLAY 的 RTSP 连接。
+type Source struct {
 	client    *gortsplib.Client
 	media     *description.Media
 	format    *format.H264
@@ -48,7 +51,14 @@ type previewSource struct {
 	closeOnce sync.Once
 }
 
-func (s *previewSource) close() {
+// Profile 返回选定的 ONVIF Profile token。
+func (s *Source) Profile() string { return s.profile }
+
+// StreamURL 返回遮蔽密码后的 RTSP 地址（仅展示用）。
+func (s *Source) StreamURL() string { return s.streamURL }
+
+// Close 释放底层 RTSP 连接（幂等）。
+func (s *Source) Close() {
 	s.closeOnce.Do(func() {
 		if s.client != nil {
 			s.client.Close()
@@ -56,10 +66,10 @@ func (s *previewSource) close() {
 	})
 }
 
-// openPreviewSource 通过 ONVIF GetProfiles/GetStreamUri 找到一条 H.264 码流并建好 RTSP 会话。
+// OpenSource 通过 ONVIF GetProfiles/GetStreamUri 找到一条 H.264 码流并建好 RTSP 会话。
 // 单项失败只影响该 Profile，不阻断其他 Profile；全部失败时返回可读原因。
-func openPreviewSource(ctx context.Context, dev *DeviceConfig, log *slog.Logger) (*previewSource, error) {
-	cli, err := newDeviceClient(dev)
+func OpenSource(ctx context.Context, dev *config.DeviceConfig, log *slog.Logger) (*Source, error) {
+	cli, err := onvifcore.NewDeviceClient(dev)
 	if err != nil {
 		return nil, fmt.Errorf("创建 ONVIF 客户端失败: %w", err)
 	}
@@ -91,13 +101,13 @@ func openPreviewSource(ctx context.Context, dev *DeviceConfig, log *slog.Logger)
 			lastErr = fmt.Errorf("%s GetStreamUri: %w", p.Token, err)
 			continue
 		}
-		rtspURL, masked, err := previewRTSPURL(mediaURI.URI, dev)
+		rtspURL, masked, err := RTSPURL(mediaURI.URI, dev)
 		if err != nil {
 			lastErr = fmt.Errorf("%s 地址非法: %w", p.Token, err)
 			continue
 		}
 		tried++
-		src, err := setupPreviewStream(rtspURL, masked, p.Token)
+		src, err := setupStream(rtspURL, masked, p.Token)
 		if err != nil {
 			lastErr = err
 			continue
@@ -114,8 +124,8 @@ func openPreviewSource(ctx context.Context, dev *DeviceConfig, log *slog.Logger)
 		tried, lastErr)
 }
 
-// previewRTSPURL 把 GetStreamUri 返回值补全凭据（设备通常不在 URI 里带账号密码）。
-func previewRTSPURL(raw string, dev *DeviceConfig) (*base.URL, string, error) {
+// RTSPURL 把 GetStreamUri 返回值补全凭据（设备通常不在 URI 里带账号密码）。
+func RTSPURL(raw string, dev *config.DeviceConfig) (*base.URL, string, error) {
 	u, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil {
 		return nil, "", err
@@ -144,9 +154,9 @@ func previewRTSPURL(raw string, dev *DeviceConfig) (*base.URL, string, error) {
 	return ru, masked, nil
 }
 
-// setupPreviewStream 用 RTSP over TCP 取 SDP、找 H.264 轨并 SETUP。
+// setupStream 用 RTSP over TCP 取 SDP、找 H.264 轨并 SETUP。
 // TCP 交织比 UDP 更容易穿透本机/局域网防火墙，且 TP-Link 实测稳定。
-func setupPreviewStream(u *base.URL, masked, profile string) (*previewSource, error) {
+func setupStream(u *base.URL, masked, profile string) (*Source, error) {
 	tcp := gortsplib.ProtocolTCP
 	c := &gortsplib.Client{
 		Scheme:       u.Scheme,
@@ -174,25 +184,29 @@ func setupPreviewStream(u *base.URL, masked, profile string) (*previewSource, er
 		c.Close()
 		return nil, fmt.Errorf("%s RTSP SETUP 失败: %w", profile, err)
 	}
-	return &previewSource{
+	return &Source{
 		client: c, media: medi, format: forma, streamURL: masked, profile: profile,
 	}, nil
 }
 
 // ---------------- WebRTC 会话管理 ----------------
 
-type previewSession struct {
+type Session struct {
 	id       string
 	cameraID int64
 	device   string
 	pc       *webrtc.PeerConnection
-	src      *previewSource
+	src      *Source
 	timer    *time.Timer
 
 	closeOnce sync.Once
 }
 
-func (s *previewSession) close() {
+// ID 返回会话标识（前端关闭时回传）。
+func (s *Session) ID() string { return s.id }
+
+// Close 释放会话资源：定时器、WebRTC 连接与 RTSP 源（幂等）。
+func (s *Session) Close() {
 	s.closeOnce.Do(func() {
 		if s.timer != nil {
 			s.timer.Stop()
@@ -201,26 +215,29 @@ func (s *previewSession) close() {
 			_ = s.pc.Close()
 		}
 		if s.src != nil {
-			s.src.close()
+			s.src.Close()
 		}
 	})
 }
 
-type previewHub struct {
+// Hub 管理全部预览会话的生命周期与并发上限。
+type Hub struct {
 	log      *slog.Logger
 	mu       sync.Mutex
-	sessions map[string]*previewSession
+	sessions map[string]*Session
 }
 
-func newPreviewHub(log *slog.Logger) *previewHub {
-	return &previewHub{log: log.With("component", "preview"), sessions: map[string]*previewSession{}}
+// NewHub 创建预览会话中心。
+func NewHub(log *slog.Logger) *Hub {
+	return &Hub{log: log.With("component", "preview"), sessions: map[string]*Session{}}
 }
 
-func (h *previewHub) add(s *previewSession) error {
+// Add 登记一个新会话，超限时返回错误（调用方负责 close 会话）。
+func (h *Hub) Add(s *Session) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if len(h.sessions) >= previewMaxSessions {
-		return fmt.Errorf("预览会话数已达上限 %d，请关闭其他预览", previewMaxSessions)
+	if len(h.sessions) >= MaxSessions {
+		return fmt.Errorf("预览会话数已达上限 %d，请关闭其他预览", MaxSessions)
 	}
 	perCamera := 0
 	for _, v := range h.sessions {
@@ -228,15 +245,15 @@ func (h *previewHub) add(s *previewSession) error {
 			perCamera++
 		}
 	}
-	if perCamera >= previewMaxPerCamera {
-		return fmt.Errorf("该摄像头的并发预览已达上限 %d", previewMaxPerCamera)
+	if perCamera >= MaxPerCamera {
+		return fmt.Errorf("该摄像头的并发预览已达上限 %d", MaxPerCamera)
 	}
 	h.sessions[s.id] = s
 	return nil
 }
 
 // remove 从表中摘除并释放资源；close() 触发的 ICE 状态回调会再次调用，因 id 已删除而不会递归。
-func (h *previewHub) remove(id string) {
+func (h *Hub) remove(id string) {
 	h.mu.Lock()
 	s, ok := h.sessions[id]
 	if ok {
@@ -244,12 +261,13 @@ func (h *previewHub) remove(id string) {
 	}
 	h.mu.Unlock()
 	if ok {
-		s.close()
+		s.Close()
 		h.log.Info("预览会话已结束", "device", s.device, "session", id)
 	}
 }
 
-func (h *previewHub) removeIf(id string, cameraID int64) {
+// RemoveIf 仅当会话 id 匹配该摄像头时才结束会话（关闭预览接口按设备定位）。
+func (h *Hub) RemoveIf(id string, cameraID int64) {
 	h.mu.Lock()
 	s, ok := h.sessions[id]
 	h.mu.Unlock()
@@ -258,26 +276,27 @@ func (h *previewHub) removeIf(id string, cameraID int64) {
 	}
 }
 
-func (h *previewHub) closeAll() {
+// CloseAll 结束全部预览会话（服务关闭时调用）。
+func (h *Hub) CloseAll() {
 	h.mu.Lock()
-	all := make([]*previewSession, 0, len(h.sessions))
+	all := make([]*Session, 0, len(h.sessions))
 	for id, s := range h.sessions {
 		all = append(all, s)
 		delete(h.sessions, id)
 	}
 	h.mu.Unlock()
 	for _, s := range all {
-		s.close()
+		s.Close()
 	}
 }
 
-// start 完成一次 offer/answer 协商并启动 RTP 转发，返回 answer SDP。
-func (h *previewHub) start(
+// Start 完成一次 offer/answer 协商并启动 RTP 转发，返回 answer SDP。
+func (h *Hub) Start(
 	ctx context.Context,
-	dev *DeviceConfig,
+	dev *config.DeviceConfig,
 	offerSDP string,
-	src *previewSource,
-) (*previewSession, string, error) {
+	src *Source,
+) (*Session, string, error) {
 	m := &webrtc.MediaEngine{}
 	if err := m.RegisterDefaultCodecs(); err != nil {
 		return nil, "", fmt.Errorf("初始化 WebRTC 编解码器失败: %w", err)
@@ -343,8 +362,8 @@ func (h *previewHub) start(
 		return nil, "", errors.New("未能生成 WebRTC answer")
 	}
 
-	sess := &previewSession{
-		id: randomToken(), cameraID: dev.ID, device: dev.Name, pc: pc, src: src,
+	sess := &Session{
+		id: util.RandomToken(), cameraID: dev.ID, device: dev.Name, pc: pc, src: src,
 	}
 	pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
 		switch state {
@@ -365,7 +384,7 @@ func (h *previewHub) start(
 	var injected atomic.Bool
 	src.client.OnPacketRTP(src.media, src.format, func(pkt *rtp.Packet) {
 		if injected.CompareAndSwap(false, true) {
-			if stap := previewStapA(src.format.SPS, src.format.PPS, pkt); stap != nil {
+			if stap := StapA(src.format.SPS, src.format.PPS, pkt); stap != nil {
 				_ = track.WriteRTP(stap)
 			}
 		}
@@ -376,16 +395,16 @@ func (h *previewHub) start(
 		return nil, "", fmt.Errorf("RTSP PLAY 失败: %w", err)
 	}
 
-	sess.timer = time.AfterFunc(previewMaxLifetime, func() { h.remove(sess.id) })
+	sess.timer = time.AfterFunc(MaxLifetime, func() { h.remove(sess.id) })
 	h.log.Info("预览会话已建立", "device", dev.Name, "session", sess.id,
 		"profile", src.profile, "stream", src.streamURL)
 	return sess, local.SDP, nil
 }
 
-// previewStapA 用 SDP 里的 SPS/PPS 构造一个 STAP-A 包，插在第一个 RTP 包之前，
+// StapA 用 SDP 里的 SPS/PPS 构造一个 STAP-A 包，插在第一个 RTP 包之前，
 // 让浏览器解码器立刻拿到参数集（部分摄像头只在关键帧前才带，启动会黑屏数秒）。
 // 序列号取首包 -1，保证单调递增；PayloadType 会被 pion 重写。
-func previewStapA(sps, pps []byte, ref *rtp.Packet) *rtp.Packet {
+func StapA(sps, pps []byte, ref *rtp.Packet) *rtp.Packet {
 	if len(sps) == 0 || len(pps) == 0 || ref == nil {
 		return nil
 	}
@@ -404,81 +423,4 @@ func previewStapA(sps, pps []byte, ref *rtp.Packet) *rtp.Packet {
 	hdr.Extension = false
 	hdr.Extensions = nil
 	return &rtp.Packet{Header: hdr, Payload: payload}
-}
-
-// ---------------- HTTP 信令 ----------------
-
-// previewOffer 接收浏览器 SDP offer，返回 answer 与会话 ID（非 trickle ICE，answer 内含全部候选）。
-func (s *APIServer) previewOffer(w http.ResponseWriter, r *http.Request) {
-	_, dev, err := s.cameraDevice(r)
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	var body struct {
-		SDP string `json:"sdp"`
-	}
-	if err := readJSON(r, &body); err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	// 注意：不能用 strings.TrimSpace 整段处理 SDP。浏览器 offer 本以 \r\n 结尾，
-	// TrimSpace 会一并裁掉结尾换行，导致 pion 解析最后一行属性时返回 io.EOF（与 H.264 无关）。
-	// 这里只去掉首尾空白字符，并保证末尾有一个换行以满足 pion 的解析要求。
-	sdp := strings.Trim(body.SDP, " \t\r\n")
-	if sdp == "" || len(sdp) > previewOfferLimit {
-		writeErr(w, http.StatusBadRequest, "缺少合法的 sdp offer")
-		return
-	}
-	if !strings.HasSuffix(sdp, "\n") {
-		sdp += "\n"
-	}
-	body.SDP = sdp
-
-	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-	defer cancel()
-	src, err := openPreviewSource(ctx, dev, s.log)
-	if err != nil {
-		writeErr(w, http.StatusBadGateway, err.Error())
-		return
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			src.close()
-		}
-	}()
-
-	sess, answer, err := s.preview.start(ctx, dev, body.SDP, src)
-	if err != nil {
-		writeErr(w, http.StatusBadGateway, err.Error())
-		return
-	}
-	if err := s.preview.add(sess); err != nil {
-		sess.close()
-		writeErr(w, http.StatusTooManyRequests, err.Error())
-		return
-	}
-	committed = true
-	writeJSON(w, http.StatusOK, map[string]any{
-		"session": sess.id,
-		"sdp":     answer,
-		"codec":   "H.264",
-		"profile": src.profile,
-		"stream":  src.streamURL,
-	})
-}
-
-// previewClose 前端关闭弹窗时主动释放会话（ICE 状态变化也会自动回收，这里是快速路径）。
-func (s *APIServer) previewClose(w http.ResponseWriter, r *http.Request) {
-	id, err := pathID(r)
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	session := r.PathValue("session")
-	if session != "" {
-		s.preview.removeIf(session, id)
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }

@@ -1,4 +1,6 @@
-package main
+// Package manager 把数据库配置映射为运行中的 ONVIF 订阅，并在配置变更后热重建。
+// 它同时实现 onvifcore.WorkerHost 接口，充当 CameraWorker 与运行时之间的宿主。
+package manager
 
 import (
 	"context"
@@ -8,33 +10,37 @@ import (
 	"sync"
 	"time"
 
+	"IpcNotice/internal/config"
+	"IpcNotice/internal/dispatch"
+	"IpcNotice/internal/onvifcore"
+	"IpcNotice/internal/store"
 	"github.com/mickeyzzc/onvif-go/v2/onvif"
 )
 
 // RuntimeInfo 是运行态总览，供前端「概览 / 运行态」页面展示。
 type RuntimeInfo struct {
-	StartedAt     string            `json:"started_at"`
-	AdvertiseHost string            `json:"advertise_host"`
-	NotifyListen  string            `json:"notify_listen"`
-	NotifyPath    string            `json:"notify_path"`
-	ConsumerBase  string            `json:"consumer_base"`
-	EventMode     string            `json:"event_mode"`
-	NotifyRunning bool              `json:"notify_running"`
-	NotifyPosts   map[string]string `json:"notify_posts"`
-	Workers       []WorkerStatus    `json:"workers"`
-	ActiveRoutes  int               `json:"active_routes"`
-	Subscriptions int64             `json:"subscriptions"`
-	LastReload    string            `json:"last_reload"`
-	LastReloadErr string            `json:"last_reload_err"`
+	StartedAt     string                  `json:"started_at"`
+	AdvertiseHost string                  `json:"advertise_host"`
+	NotifyListen  string                  `json:"notify_listen"`
+	NotifyPath    string                  `json:"notify_path"`
+	ConsumerBase  string                  `json:"consumer_base"`
+	EventMode     string                  `json:"event_mode"`
+	NotifyRunning bool                    `json:"notify_running"`
+	NotifyPosts   map[string]string       `json:"notify_posts"`
+	Workers       []onvifcore.WorkerStatus `json:"workers"`
+	ActiveRoutes  int                     `json:"active_routes"`
+	Subscriptions int64                   `json:"subscriptions"`
+	LastReload    string                  `json:"last_reload"`
+	LastReloadErr string                  `json:"last_reload_err"`
 }
 
-// Manager 把数据库配置映射为运行中的 ONVIF 订阅，并在配置变更后热重建。
+// Manager 管理全部设备的订阅生命周期、Notify 接收端与事件分发器。
 type Manager struct {
 	ctx        context.Context
-	store      *Store
+	store      *store.Store
 	log        *slog.Logger
-	notify     *NotifyServer
-	dispatcher *Dispatcher
+	notify     *onvifcore.NotifyServer
+	dispatcher *dispatch.Dispatcher
 
 	advertiseHost string
 	notifyRunning bool
@@ -42,14 +48,26 @@ type Manager struct {
 	lastReload    string
 	lastReloadErr string
 
-	reloadMu  sync.Mutex
+	reloadMu sync.Mutex
 	mu        sync.RWMutex
-	st        Settings
-	workers   map[int64]*cameraWorker
+	st        config.Settings
+	workers   map[int64]*onvifcore.CameraWorker
 	cameraIDs map[string]int64
 }
 
-func NewManager(ctx context.Context, store *Store, logger *slog.Logger) (*Manager, error) {
+// ---- WorkerHost 实现（CameraWorker 通过本接口反向访问运行态） ----
+
+func (m *Manager) Context() context.Context          { return m.ctx }
+func (m *Manager) Logger() *slog.Logger             { return m.log }
+func (m *Manager) Store() *store.Store              { return m.store }
+func (m *Manager) Settings() config.Settings        { return m.settings() }
+func (m *Manager) ConsumerURL(dev *config.DeviceConfig) string { return m.notify.ConsumerURL(dev) }
+func (m *Manager) Submit(dev *config.DeviceConfig, transport string, msgs []onvif.NotificationMessage) {
+	m.dispatcher.Submit(dev, transport, msgs)
+}
+
+// NewManager 从数据库加载配置，启动 Notify 接收端、分发器并建立初始订阅。
+func NewManager(ctx context.Context, store *store.Store, logger *slog.Logger) (*Manager, error) {
 	st, err := store.Settings()
 	if err != nil {
 		return nil, err
@@ -57,7 +75,7 @@ func NewManager(ctx context.Context, store *Store, logger *slog.Logger) (*Manage
 	m := &Manager{
 		ctx: ctx, store: store, log: logger, st: st,
 		startedAt: time.Now().UTC().Format(time.RFC3339),
-		workers:   map[int64]*cameraWorker{},
+		workers:   map[int64]*onvifcore.CameraWorker{},
 		cameraIDs: map[string]int64{},
 	}
 
@@ -77,7 +95,7 @@ func NewManager(ctx context.Context, store *Store, logger *slog.Logger) (*Manage
 		logger.Warn("数据库尚无摄像头，通告地址暂用占位值；新增设备后会自动重新探测并更新",
 			"advertise_host", host)
 	} else {
-		host, isLocal, err = ResolveAdvertiseHost(st.AdvertiseHost, firstHost)
+		host, isLocal, err = onvifcore.ResolveAdvertiseHost(st.AdvertiseHost, firstHost)
 		if err != nil {
 			return nil, err
 		}
@@ -88,8 +106,8 @@ func NewManager(ctx context.Context, store *Store, logger *slog.Logger) (*Manage
 	}
 	m.advertiseHost = host
 
-	notify, err := NewNotifyServer(st.Server(), host, devs,
-		func(dev *DeviceConfig, msgs []onvif.NotificationMessage) {
+	notify, err := onvifcore.NewNotifyServer(st.Server(), host, devs,
+		func(dev *config.DeviceConfig, msgs []onvif.NotificationMessage) {
 			m.dispatcher.Submit(dev, "push", msgs)
 		}, logger)
 	if err != nil {
@@ -97,7 +115,7 @@ func NewManager(ctx context.Context, store *Store, logger *slog.Logger) (*Manage
 	}
 	m.notify = notify
 
-	d, err := NewDispatcher(store, st, logger)
+	d, err := dispatch.NewDispatcher(store, st, logger)
 	if err != nil {
 		return nil, err
 	}
@@ -116,8 +134,8 @@ func NewManager(ctx context.Context, store *Store, logger *slog.Logger) (*Manage
 	return m, nil
 }
 
-func devicesFromCameras(cameras []Camera) ([]*DeviceConfig, string) {
-	devs := make([]*DeviceConfig, 0, len(cameras))
+func devicesFromCameras(cameras []store.Camera) ([]*config.DeviceConfig, string) {
+	devs := make([]*config.DeviceConfig, 0, len(cameras))
 	firstHost := ""
 	for _, c := range cameras {
 		if !c.Enabled {
@@ -135,7 +153,7 @@ func devicesFromCameras(cameras []Camera) ([]*DeviceConfig, string) {
 	return devs, firstHost
 }
 
-func (m *Manager) settings() Settings {
+func (m *Manager) settings() config.Settings {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.st
@@ -173,10 +191,10 @@ func (m *Manager) Reload() error {
 		return err
 	}
 
-	cameraByID := map[int64]Camera{}
+	cameraByID := map[int64]store.Camera{}
 	idsByName := map[string]int64{}
-	devs := []*DeviceConfig{}
-	devByID := map[int64]*DeviceConfig{}
+	devs := []*config.DeviceConfig{}
+	devByID := map[int64]*config.DeviceConfig{}
 	for _, c := range cameras {
 		cameraByID[c.ID] = c
 		if !c.Enabled {
@@ -191,14 +209,14 @@ func (m *Manager) Reload() error {
 		devByID[c.ID] = dev
 		devs = append(devs, dev)
 	}
-	channelByID := map[int64]WebhookChannel{}
+	channelByID := map[int64]store.WebhookChannel{}
 	for _, ch := range channels {
 		if ch.Enabled {
 			channelByID[ch.ID] = ch
 		}
 	}
 
-	rt := emptyRouteTable()
+	rt := dispatch.EmptyRouteTable()
 	rt.CameraIDs = idsByName
 	for _, cam := range cameras {
 		if remarks := topicRemarks[cam.ID]; len(remarks) > 0 {
@@ -215,13 +233,14 @@ func (m *Manager) Reload() error {
 		}
 		activeSubs++
 		desired[sub.CameraID] = true
-		picked := []WebhookChannel{}
+		picked := []store.WebhookChannel{}
 		for _, id := range sub.ChannelIDs {
 			if ch, ok := channelByID[id]; ok {
 				picked = append(picked, ch)
 			}
 		}
-		rt.ByCamera[cam.Name] = append(rt.ByCamera[cam.Name], Route{Topic: sub.Topic, Channels: picked})
+		rt.ByCamera[cam.Name] = append(rt.ByCamera[cam.Name],
+			dispatch.Route{Topic: sub.Topic, Channels: picked})
 		routeCount++
 	}
 
@@ -243,7 +262,7 @@ func (m *Manager) Reload() error {
 		configured := strings.TrimSpace(st.AdvertiseHost)
 		newHost := m.advertiseHost
 		if configured == "" || strings.EqualFold(configured, "auto") {
-			if h, _, err := ResolveAdvertiseHost("auto", devs[0].Host); err == nil && h != "" {
+			if h, _, err := onvifcore.ResolveAdvertiseHost("auto", devs[0].Host); err == nil && h != "" {
 				newHost = h
 			}
 		} else {
@@ -261,11 +280,11 @@ func (m *Manager) Reload() error {
 	//（如仅改显示名：回调地址由 token 决定，订阅无需重建）。
 	for id, w := range workers {
 		dev := devByID[id]
-		if !desired[id] || dev == nil || w.hash != deviceHash(dev, st) {
-			w.stop()
+		if !desired[id] || dev == nil || w.Hash() != onvifcore.DeviceHash(dev, st) {
+			w.Stop()
 			delete(workers, id)
 		} else {
-			w.dev.Store(dev)
+			w.RefreshDevice(dev)
 		}
 	}
 	for id := range desired {
@@ -276,9 +295,9 @@ func (m *Manager) Reload() error {
 		if dev == nil {
 			continue
 		}
-		w := newCameraWorker(m, dev, deviceHash(dev, st))
+		w := onvifcore.NewCameraWorker(m, dev, onvifcore.DeviceHash(dev, st), id)
 		workers[id] = w
-		w.start()
+		w.Start()
 		m.log.Info("已启动设备事件订阅", "device", dev.Name, "endpoint", dev.Endpoint)
 	}
 
@@ -297,10 +316,11 @@ func (m *Manager) setReloadErr(err error) {
 	m.mu.Unlock()
 }
 
+// Status 返回运行态总览快照。
 func (m *Manager) Status() RuntimeInfo {
 	m.mu.RLock()
 	st := m.st
-	workers := make([]*cameraWorker, 0, len(m.workers))
+	workers := make([]*onvifcore.CameraWorker, 0, len(m.workers))
 	for _, w := range m.workers {
 		workers = append(workers, w)
 	}
@@ -308,23 +328,19 @@ func (m *Manager) Status() RuntimeInfo {
 	host, running := m.advertiseHost, m.notifyRunning
 	m.mu.RUnlock()
 
-	statuses := make([]WorkerStatus, 0, len(workers))
+	statuses := make([]onvifcore.WorkerStatus, 0, len(workers))
 	for _, w := range workers {
 		s := w.Status()
 		s.LastNotifyAt = m.notify.LastNotifyAt(s.Device)
 		statuses = append(statuses, s)
 	}
 	active, _ := m.store.ActiveSubscriptionCount()
-	routes := 0
-	for _, s := range m.dispatcher.routes.Load().ByCamera {
-		routes += len(s)
-	}
 	return RuntimeInfo{
 		StartedAt: started, AdvertiseHost: host,
 		NotifyListen: st.NotifyListenAddr, NotifyPath: st.NotifyPath,
 		ConsumerBase: m.notify.BaseURL(), EventMode: st.EventMode,
 		NotifyRunning: running, NotifyPosts: m.notify.PostCounts(),
-		Workers: statuses, ActiveRoutes: routes, Subscriptions: active,
+		Workers: statuses, ActiveRoutes: m.dispatcher.RouteCount(), Subscriptions: active,
 		LastReload: reloaded, LastReloadErr: reloadErr,
 	}
 }
@@ -334,13 +350,13 @@ func (m *Manager) Shutdown() {
 	m.reloadMu.Lock()
 	defer m.reloadMu.Unlock()
 	m.mu.RLock()
-	workers := make([]*cameraWorker, 0, len(m.workers))
+	workers := make([]*onvifcore.CameraWorker, 0, len(m.workers))
 	for _, w := range m.workers {
 		workers = append(workers, w)
 	}
 	m.mu.RUnlock()
 	for _, w := range workers {
-		w.stop()
+		w.Stop()
 	}
 	m.dispatcher.Close()
 	if m.notifyRunning {

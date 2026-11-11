@@ -1,10 +1,12 @@
-package main
+package store
 
 import (
 	"encoding/json"
 	"errors"
 	"log/slog"
 	"os"
+
+	"IpcNotice/internal/config"
 )
 
 // legacyConfig 只用于把 beta 第一版 config.json 的内容迁移进数据库。
@@ -39,7 +41,8 @@ type legacyConfig struct {
 	} `json:"devices"`
 }
 
-func migrateLegacy(path string, store *Store, logger *slog.Logger) (bool, error) {
+// MigrateLegacy 把旧版 config.json 的设备/通道/系统参数迁移进数据库，并把它重写为精简版。
+func MigrateLegacy(path string, store *Store, logger *slog.Logger) (bool, error) {
 	raw, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
@@ -55,7 +58,7 @@ func migrateLegacy(path string, store *Store, logger *slog.Logger) (bool, error)
 		return false, nil // 已是精简版配置
 	}
 
-	st := DefaultSettings()
+	st := config.DefaultSettings()
 	if legacy.Server.ListenAddr != "" {
 		st.NotifyListenAddr = legacy.Server.ListenAddr
 	}
@@ -131,7 +134,7 @@ func migrateLegacy(path string, store *Store, logger *slog.Logger) (bool, error)
 		}
 	}
 
-	cfg := defaultConfig()
+	cfg := config.DefaultConfig()
 	b, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return false, err

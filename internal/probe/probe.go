@@ -1,4 +1,5 @@
-package main
+// Package probe 封装设备连通性测试、TopicSet 抓取与 ONVIF 设备信息聚合。
+package probe
 
 import (
 	"context"
@@ -11,6 +12,9 @@ import (
 	"strings"
 	"time"
 
+	"IpcNotice/internal/config"
+	"IpcNotice/internal/onvifcore"
+	"IpcNotice/internal/util"
 	"github.com/mickeyzzc/onvif-go/v2/analytics"
 	"github.com/mickeyzzc/onvif-go/v2/device"
 	"github.com/mickeyzzc/onvif-go/v2/events"
@@ -39,24 +43,11 @@ type DeviceTestResult struct {
 	Warnings         []string `json:"warnings"`
 }
 
-// newDeviceClient 构造带鉴权梯队与时钟偏差校正的 ONVIF 客户端。
-func newDeviceClient(dev *DeviceConfig) (*onvif.Client, error) {
-	timeout := 12 * time.Second
-	return onvif.NewClient(
-		dev.Endpoint,
-		onvif.WithHTTPClient(newONVIFHTTPClient(timeout)),
-		onvif.WithCredentials(dev.DeviceUser, dev.DevicePass),
-		onvif.WithTimeout(timeout),
-		onvif.WithAutoClockSkew(),
-		onvif.WithAuthFallback(onvif.AuthPasswordText, onvif.AuthHTTPBasic),
-	)
-}
-
-// testDevice 连接设备、读取设备信息与事件能力；captureSeconds>0 时额外做一次
+// TestDevice 连接设备、读取设备信息与事件能力；captureSeconds>0 时额外做一次
 // 短时 PullPoint 实抓，用于补齐 TP-Link 固件「实际推送主题与 TopicSet 不一致」的部分。
-func testDevice(ctx context.Context, dev *DeviceConfig, logger *slog.Logger, captureSeconds int) (DeviceTestResult, error) {
+func TestDevice(ctx context.Context, dev *config.DeviceConfig, logger *slog.Logger, captureSeconds int) (DeviceTestResult, error) {
 	r := DeviceTestResult{Topics: []string{}, ObservedTopics: []string{}, Warnings: []string{}}
-	cli, err := newDeviceClient(dev)
+	cli, err := onvifcore.NewDeviceClient(dev)
 	if err != nil {
 		return r, fmt.Errorf("创建 ONVIF 客户端失败: %w", err)
 	}
@@ -104,7 +95,7 @@ func testDevice(ctx context.Context, dev *DeviceConfig, logger *slog.Logger, cap
 		r.Warnings = append(r.Warnings, "TopicSet 主题枚举失败: "+err.Error())
 	} else {
 		for _, t := range topics {
-			r.Topics = append(r.Topics, normalizeTopic(t))
+			r.Topics = append(r.Topics, util.NormalizeTopic(t))
 		}
 		r.Topics = uniqueNonEmpty(r.Topics)
 	}
@@ -169,7 +160,7 @@ func captureLiveTopics(ctx context.Context, cli *onvif.Client, seconds int) ([]s
 			continue
 		}
 		for _, m := range msgs {
-			if t := normalizeTopic(m.Topic); t != "" {
+			if t := util.NormalizeTopic(m.Topic); t != "" {
 				seen[t] = true
 			}
 		}
@@ -180,38 +171,6 @@ func captureLiveTopics(ctx context.Context, cli *onvif.Client, seconds int) ([]s
 	}
 	sort.Strings(out)
 	return out, nil
-}
-
-// normalizeTopic 去掉各段命名空间前缀（tns1: / wstop: 等），
-// 使 TopicSet 枚举出的层级路径与真实 Notify 主题可以互相匹配。
-func normalizeTopic(s string) string {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return ""
-	}
-	parts := strings.Split(s, "/")
-	for i, p := range parts {
-		if idx := strings.LastIndex(p, ":"); idx >= 0 {
-			p = p[idx+1:]
-		}
-		parts[i] = strings.TrimSpace(p)
-	}
-	return strings.Trim(strings.Join(parts, "/"), "/")
-}
-
-// matchTopic 支持以 /* 结尾的通配订阅，其余按规范化后的路径精确匹配。
-func matchTopic(pattern, actual string) bool {
-	p, a := normalizeTopic(pattern), normalizeTopic(actual)
-	if p == "" || a == "" {
-		return false
-	}
-	if p == a || p == "*" {
-		return true
-	}
-	if strings.HasSuffix(p, "/*") {
-		return strings.HasPrefix(a, strings.TrimSuffix(p, "*"))
-	}
-	return false
 }
 
 func uniqueNonEmpty(in []string) []string {
@@ -251,14 +210,14 @@ func fetchTopicPaths(ctx context.Context, cli *onvif.Client) ([]string, error) {
 	if err := cli.Call(ctx, cli.EndpointFor("events"), "", req, &resp); err != nil {
 		return nil, err
 	}
-	return parseTopicSet(resp.TopicSet.Inner)
+	return ParseTopicSet(resp.TopicSet.Inner)
 }
 
 // descriptionElements 是 TopicSet 里描述消息结构的节点，不是事件主题。
 var descriptionElements = map[string]bool{
 	"MessageDescription":           true,
 	"MessageDescriptionExtension":  true,
-	"SimpleItemDescription":        true,
+	"SimpleItemDescription":         true,
 	"ElementItemDescription":       true,
 	"Source":                       true,
 	"Key":                          true,
@@ -267,10 +226,10 @@ var descriptionElements = map[string]bool{
 	"MessageDescriptionExtension2": true,
 }
 
-// parseTopicSet 用宽容的 token 解析收集 TopicSet 树中的全部主题路径。
+// ParseTopicSet 用宽容的 token 解析收集 TopicSet 树中的全部主题路径。
 // ONVIF TopicSet 用元素名表达主题层级，且常带未声明的前缀（tns1:/wstop:），
 // 因此关闭 strict 命名空间校验。
-func parseTopicSet(inner string) ([]string, error) {
+func ParseTopicSet(inner string) ([]string, error) {
 	if strings.TrimSpace(inner) == "" {
 		return nil, nil
 	}
@@ -330,14 +289,14 @@ type DeviceInfoRow struct {
 // 展示形态三选一：Rows（键值对）、Columns+Records（多条目表格）、Text（长文本）。
 type DeviceInfoItem struct {
 	Operation string          `json:"operation"`
-	Label     string          `json:"label"`
-	OK        bool            `json:"ok"`
-	Error     string          `json:"error,omitempty"`
-	Rows      []DeviceInfoRow `json:"rows,omitempty"`
-	Columns   []string        `json:"columns,omitempty"`
-	Records   [][]string      `json:"records,omitempty"`
-	Text      string          `json:"text,omitempty"`
-	Truncated bool            `json:"truncated,omitempty"`
+	Label      string         `json:"label"`
+	OK         bool           `json:"ok"`
+	Error      string         `json:"error,omitempty"`
+	Rows       []DeviceInfoRow `json:"rows,omitempty"`
+	Columns    []string       `json:"columns,omitempty"`
+	Records    [][]string     `json:"records,omitempty"`
+	Text       string         `json:"text,omitempty"`
+	Truncated  bool           `json:"truncated,omitempty"`
 }
 
 type DeviceInfoSection struct {
@@ -382,9 +341,9 @@ func boolCN(v bool) string {
 	return "否"
 }
 
-// briefInfoError 精简设备返回的错误：上游库会把整段 SOAP Fault XML 拼进 error，
+// BriefInfoError 精简设备返回的错误：上游库会把整段 SOAP Fault XML 拼进 error，
 // 界面只保留 HTTP 状态与 ONVIF 错误码，并对常见「不支持」给出可读说明。
-func briefInfoError(err error) string {
+func BriefInfoError(err error) string {
 	if err == nil {
 		return ""
 	}
@@ -444,15 +403,16 @@ func joinNonEmpty(parts []string) string {
 	return strings.Join(out, ", ")
 }
 
-func clipInfoText(s string) (string, bool) {
+// ClipInfoText 截断超长的设备长文本（系统日志/支持信息）。
+func ClipInfoText(s string) (string, bool) {
 	if len(s) <= deviceInfoTextLimit {
 		return strings.ToValidUTF8(s, ""), false
 	}
 	return strings.ToValidUTF8(s[:deviceInfoTextLimit], ""), true
 }
 
-// flattenInfoJSON 把 GetCapabilities 的嵌套结构展平为可读的键值对。
-func flattenInfoJSON(v any) []DeviceInfoRow {
+// FlattenInfoJSON 把 GetCapabilities 的嵌套结构展平为可读的键值对。
+func FlattenInfoJSON(v any) []DeviceInfoRow {
 	b, err := json.Marshal(v)
 	if err != nil {
 		return nil
@@ -497,19 +457,15 @@ func networkHostText(v device.NetworkHost) string {
 	return joinNonEmpty([]string{v.IPv4Address, v.IPv6Address, v.DNSname})
 }
 
-func joinIPAddresses(items []types.IPAddress) string {
-	parts := make([]string, 0, len(items))
+// JoinIPAddressesAndHosts 把 IPv4/IPv6 地址与网络主机（NTP/DNS）拼接为可读文本。
+func JoinIPAddressesAndHosts(items []types.IPAddress, hosts []device.NetworkHost) string {
+	parts := make([]string, 0, len(items)+len(hosts))
 	for _, v := range items {
 		if s := ipAddressText(v); s != "" {
 			parts = append(parts, s)
 		}
 	}
-	return strings.Join(parts, ", ")
-}
-
-func joinNetworkHosts(items []device.NetworkHost) string {
-	parts := make([]string, 0, len(items))
-	for _, v := range items {
+	for _, v := range hosts {
 		if s := networkHostText(v); s != "" {
 			parts = append(parts, s)
 		}
@@ -528,10 +484,10 @@ func dateTimeText(dt *device.DateTime) string {
 
 // ---------------- ONVIF 事件能力 / 分析配置展示辅助 ----------------
 
-// eventCapabilityRows 展示 Event 服务 GetServiceCapabilities 的全部字段。
+// EventCapabilityRows 展示 Event 服务 GetServiceCapabilities 的全部字段。
 // 注意：Device 服务的 GetCapabilities 不含 MaxNotificationProducers；
 // 订阅槽上限只能从 Event 服务能力里取。
-func eventCapabilityRows(v *events.EventServiceCapabilities) []DeviceInfoRow {
+func EventCapabilityRows(v *events.EventServiceCapabilities) []DeviceInfoRow {
 	if v == nil {
 		return nil
 	}
@@ -547,7 +503,6 @@ func eventCapabilityRows(v *events.EventServiceCapabilities) []DeviceInfoRow {
 	}
 }
 
-// analyticsParams 把 tt:Config 的 SimpleItem 参数格式化为 name=value; ...。
 func analyticsParams(items []analytics.SimpleItem) string {
 	parts := make([]string, 0, len(items))
 	for _, p := range items {
@@ -556,10 +511,10 @@ func analyticsParams(items []analytics.SimpleItem) string {
 	return strings.Join(parts, "; ")
 }
 
-// supportedInfo 把 GetSupportedAnalyticsModules / GetSupportedRules 的结果转成
+// SupportedInfo 把 GetSupportedAnalyticsModules / GetSupportedRules 的结果转成
 // 表格。设备可能只声明支持却返回空描述列表（TP-Link 固件即如此），此时给出
 // 说明行，避免界面显示「获取成功」却一片空白。
-func supportedInfo(v *analytics.Supported) ([]DeviceInfoRow, []string, [][]string) {
+func SupportedInfo(v *analytics.Supported) ([]DeviceInfoRow, []string, [][]string) {
 	if v == nil || len(v.Descriptions) == 0 {
 		rows := []DeviceInfoRow{
 			{"类型描述条目数", "0"},
@@ -584,8 +539,8 @@ func supportedInfo(v *analytics.Supported) ([]DeviceInfoRow, []string, [][]strin
 	return nil, cols, records
 }
 
-// configInfo 把 GetAnalyticsModules / GetRules 的 Config 列表转成表格。
-func configInfo(items []*analytics.Config) ([]string, [][]string) {
+// ConfigInfo 把 GetAnalyticsModules / GetRules 的 Config 列表转成表格。
+func ConfigInfo(items []*analytics.Config) ([]string, [][]string) {
 	cols := []string{"名称", "类型", "参数个数", "参数"}
 	records := make([][]string, 0, len(items))
 	for _, c := range items {
@@ -598,9 +553,9 @@ func configInfo(items []*analytics.Config) ([]string, [][]string) {
 	return cols, records
 }
 
-// collectDeviceInfo 逐项尽力调用 ONVIF 设备服务，按 基本信息/系统信息/网络信息/分析配置 分组返回。
+// CollectDeviceInfo 逐项尽力调用 ONVIF 设备服务，按 基本信息/系统信息/网络信息/分析配置 分组返回。
 // 单项失败只记录该项错误（通常是设备不支持），其余操作继续执行。
-func collectDeviceInfo(parent context.Context, dev *DeviceConfig, logger *slog.Logger) DeviceInfoResult {
+func CollectDeviceInfo(parent context.Context, dev *config.DeviceConfig, logger *slog.Logger) DeviceInfoResult {
 	start := time.Now()
 	res := DeviceInfoResult{
 		Device:    dev.Name,
@@ -609,7 +564,7 @@ func collectDeviceInfo(parent context.Context, dev *DeviceConfig, logger *slog.L
 		Sections:  []DeviceInfoSection{},
 		Warnings:  []string{},
 	}
-	cli, err := newDeviceClient(dev)
+	cli, err := onvifcore.NewDeviceClient(dev)
 	if err != nil {
 		res.Warnings = append(res.Warnings, "创建 ONVIF 客户端失败: "+err.Error())
 		res.ElapsedMs = time.Since(start).Milliseconds()
@@ -638,7 +593,7 @@ func collectDeviceInfo(parent context.Context, dev *DeviceConfig, logger *slog.L
 		"厂商、型号、固件版本、序列号、硬件 ID", func(c context.Context, it *DeviceInfoItem) {
 			v, err := svc.GetDeviceInformation(c)
 			if err != nil {
-				it.Error = briefInfoError(err)
+				it.Error = BriefInfoError(err)
 				return
 			}
 			it.OK = true
@@ -652,7 +607,7 @@ func collectDeviceInfo(parent context.Context, dev *DeviceConfig, logger *slog.L
 		"设备提供的 ONVIF 服务及 XAddr", func(c context.Context, it *DeviceInfoItem) {
 			v, err := svc.GetServices(c, false)
 			if err != nil {
-				it.Error = briefInfoError(err)
+				it.Error = BriefInfoError(err)
 				return
 			}
 			it.OK = true
@@ -676,11 +631,11 @@ func collectDeviceInfo(parent context.Context, dev *DeviceConfig, logger *slog.L
 		func(c context.Context, it *DeviceInfoItem) {
 			v, err := cli.Events().GetEventServiceCapabilities(c)
 			if err != nil {
-				it.Error = briefInfoError(err)
+				it.Error = BriefInfoError(err)
 				return
 			}
 			it.OK = true
-			it.Rows = eventCapabilityRows(v)
+			it.Rows = EventCapabilityRows(v)
 			res.MaxNotificationProducers = v.MaxNotificationProducers
 			res.MaxPullPoints = v.MaxPullPoints
 		}))
@@ -688,11 +643,11 @@ func collectDeviceInfo(parent context.Context, dev *DeviceConfig, logger *slog.L
 		"设备支持的功能能力", func(c context.Context, it *DeviceInfoItem) {
 			v, err := svc.GetCapabilities(c)
 			if err != nil {
-				it.Error = briefInfoError(err)
+				it.Error = BriefInfoError(err)
 				return
 			}
 			it.OK = true
-			it.Rows = flattenInfoJSON(v)
+			it.Rows = FlattenInfoJSON(v)
 		}))
 
 	// ---- 系统信息 ----
@@ -701,7 +656,7 @@ func collectDeviceInfo(parent context.Context, dev *DeviceConfig, logger *slog.L
 		"设备时间、时区、时间同步状态", func(c context.Context, it *DeviceInfoItem) {
 			v, err := svc.FixedGetSystemDateAndTime(c)
 			if err != nil {
-				it.Error = briefInfoError(err)
+				it.Error = BriefInfoError(err)
 				return
 			}
 			it.OK = true
@@ -721,12 +676,12 @@ func collectDeviceInfo(parent context.Context, dev *DeviceConfig, logger *slog.L
 		"系统日志（设备支持时）", func(c context.Context, it *DeviceInfoItem) {
 			v, err := svc.GetSystemLog(c, device.SystemLogTypeSystem)
 			if err != nil {
-				it.Error = briefInfoError(err)
+				it.Error = BriefInfoError(err)
 				return
 			}
 			it.OK = true
 			if v.String != "" {
-				it.Text, it.Truncated = clipInfoText(v.String)
+				it.Text, it.Truncated = ClipInfoText(v.String)
 			} else if v.Binary != nil {
 				it.Text = "设备返回二进制日志（ContentType=" + v.Binary.ContentType + "），暂不展示内容"
 			} else {
@@ -737,12 +692,12 @@ func collectDeviceInfo(parent context.Context, dev *DeviceConfig, logger *slog.L
 		"系统支持信息（设备支持时）", func(c context.Context, it *DeviceInfoItem) {
 			v, err := svc.GetSystemSupportInformation(c)
 			if err != nil {
-				it.Error = briefInfoError(err)
+				it.Error = BriefInfoError(err)
 				return
 			}
 			it.OK = true
 			if v.String != "" {
-				it.Text, it.Truncated = clipInfoText(v.String)
+				it.Text, it.Truncated = ClipInfoText(v.String)
 			} else if v.Binary != nil {
 				it.Text = "设备返回二进制支持信息（ContentType=" + v.Binary.ContentType + "），暂不展示内容"
 			} else {
@@ -756,7 +711,7 @@ func collectDeviceInfo(parent context.Context, dev *DeviceConfig, logger *slog.L
 		"网卡、MAC、IP、子网掩码", func(c context.Context, it *DeviceInfoItem) {
 			v, err := svc.GetNetworkInterfaces(c)
 			if err != nil {
-				it.Error = briefInfoError(err)
+				it.Error = BriefInfoError(err)
 				return
 			}
 			it.OK = true
@@ -799,7 +754,7 @@ func collectDeviceInfo(parent context.Context, dev *DeviceConfig, logger *slog.L
 		"HTTP、HTTPS、RTSP 等协议及端口", func(c context.Context, it *DeviceInfoItem) {
 			v, err := svc.GetNetworkProtocols(c)
 			if err != nil {
-				it.Error = briefInfoError(err)
+				it.Error = BriefInfoError(err)
 				return
 			}
 			it.OK = true
@@ -821,36 +776,36 @@ func collectDeviceInfo(parent context.Context, dev *DeviceConfig, logger *slog.L
 		"DNS 配置", func(c context.Context, it *DeviceInfoItem) {
 			v, err := svc.GetDNS(c)
 			if err != nil {
-				it.Error = briefInfoError(err)
+				it.Error = BriefInfoError(err)
 				return
 			}
 			it.OK = true
 			it.Rows = []DeviceInfoRow{
 				{"FromDHCP", boolCN(v.FromDHCP)},
 				{"SearchDomain", strings.Join(v.SearchDomain, ", ")},
-				{"DNS（DHCP）", joinIPAddresses(v.DNSFromDHCP)},
-				{"DNS（手动）", joinIPAddresses(v.DNSManual)},
+				{"DNS（DHCP）", JoinIPAddressesAndHosts(v.DNSFromDHCP, nil)},
+				{"DNS（手动）", JoinIPAddressesAndHosts(v.DNSManual, nil)},
 			}
 		}))
 	network.Items = append(network.Items, infoCall(ctx, "GetNTP",
 		"NTP 配置", func(c context.Context, it *DeviceInfoItem) {
 			v, err := svc.GetNTP(c)
 			if err != nil {
-				it.Error = briefInfoError(err)
+				it.Error = BriefInfoError(err)
 				return
 			}
 			it.OK = true
 			it.Rows = []DeviceInfoRow{
 				{"FromDHCP", boolCN(v.FromDHCP)},
-				{"NTP（DHCP）", joinNetworkHosts(v.NTPFromDHCP)},
-				{"NTP（手动）", joinNetworkHosts(v.NTPManual)},
+				{"NTP（DHCP）", JoinIPAddressesAndHosts(nil, v.NTPFromDHCP)},
+				{"NTP（手动）", JoinIPAddressesAndHosts(nil, v.NTPManual)},
 			}
 		}))
 	network.Items = append(network.Items, infoCall(ctx, "GetHostname",
 		"主机名", func(c context.Context, it *DeviceInfoItem) {
 			v, err := svc.GetHostname(c)
 			if err != nil {
-				it.Error = briefInfoError(err)
+				it.Error = BriefInfoError(err)
 				return
 			}
 			it.OK = true
@@ -872,7 +827,7 @@ func collectDeviceInfo(parent context.Context, dev *DeviceConfig, logger *slog.L
 		"分析服务能力：规则与分析模块支持情况", func(c context.Context, it *DeviceInfoItem) {
 			v, err := cli.Analytics().GetServiceCapabilities(c)
 			if err != nil {
-				it.Error = briefInfoError(err)
+				it.Error = BriefInfoError(err)
 				return
 			}
 			it.OK = true
@@ -885,41 +840,41 @@ func collectDeviceInfo(parent context.Context, dev *DeviceConfig, logger *slog.L
 		"支持的分析模块类型（默认配置）", func(c context.Context, it *DeviceInfoItem) {
 			v, err := cli.Analytics().GetSupportedAnalyticsModules(c, "")
 			if err != nil {
-				it.Error = briefInfoError(err)
+				it.Error = BriefInfoError(err)
 				return
 			}
 			it.OK = true
-			it.Rows, it.Columns, it.Records = supportedInfo(v)
+			it.Rows, it.Columns, it.Records = SupportedInfo(v)
 		}))
 	analytic.Items = append(analytic.Items, infoCall(ctx, "GetAnalyticsModules",
 		"当前配置的分析模块（默认配置）", func(c context.Context, it *DeviceInfoItem) {
 			v, err := cli.Analytics().GetAnalyticsModules(c, "")
 			if err != nil {
-				it.Error = briefInfoError(err)
+				it.Error = BriefInfoError(err)
 				return
 			}
 			it.OK = true
-			it.Columns, it.Records = configInfo(v)
+			it.Columns, it.Records = ConfigInfo(v)
 		}))
 	analytic.Items = append(analytic.Items, infoCall(ctx, "GetSupportedRules",
 		"支持的规则类型（默认配置）", func(c context.Context, it *DeviceInfoItem) {
 			v, err := cli.Analytics().GetSupportedRules(c, "")
 			if err != nil {
-				it.Error = briefInfoError(err)
+				it.Error = BriefInfoError(err)
 				return
 			}
 			it.OK = true
-			it.Rows, it.Columns, it.Records = supportedInfo(v)
+			it.Rows, it.Columns, it.Records = SupportedInfo(v)
 		}))
 	analytic.Items = append(analytic.Items, infoCall(ctx, "GetRules",
 		"当前配置的分析规则（默认配置）", func(c context.Context, it *DeviceInfoItem) {
 			v, err := cli.Analytics().GetRules(c, "")
 			if err != nil {
-				it.Error = briefInfoError(err)
+				it.Error = BriefInfoError(err)
 				return
 			}
 			it.OK = true
-			it.Columns, it.Records = configInfo(v)
+			it.Columns, it.Records = ConfigInfo(v)
 		}))
 
 	res.Sections = append(res.Sections, basic, system, network, analytic)

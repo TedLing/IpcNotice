@@ -1,4 +1,5 @@
-package main
+// Package config 定义登录配置、运行期系统参数与单台摄像头设备配置。
+package config
 
 import (
 	"encoding/json"
@@ -23,15 +24,14 @@ type Config struct {
 	Path     string `json:"-"`
 }
 
-func defaultConfig() Config {
-	// 默认密码只是占位示例，首次启动会告警提示修改；真实凭据只存在被 .gitignore
-	// 排除的 config.json 中，切勿把真实密码写进源码或提交到仓库。
+// DefaultConfig 返回带占位密码的默认配置（真实凭据只存在于被 .gitignore 排除的 config.json）。
+func DefaultConfig() Config {
 	return Config{Username: "admin", Password: "change-me", Port: 8080}
 }
 
 // LoadConfig 读取配置；文件不存在时生成一份带默认值的配置并提示修改密码。
 func LoadConfig(path string) (*Config, error) {
-	cfg := defaultConfig()
+	cfg := DefaultConfig()
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
@@ -114,6 +114,7 @@ type Settings struct {
 	UpdatedAt    string `json:"updated_at,omitempty"`
 }
 
+// DefaultSettings 返回系统参数的出厂默认值。
 func DefaultSettings() Settings {
 	return Settings{
 		NotifyListenAddr:      "0.0.0.0:9100",
@@ -229,6 +230,7 @@ type DeviceConfig struct {
 	SubManager string `json:"-"`
 }
 
+// MaskedURL 返回遮蔽密码后的连接地址（仅用于日志与界面展示）。
 func (d *DeviceConfig) MaskedURL() string {
 	u, err := url.Parse(d.URL)
 	if err != nil {
@@ -240,9 +242,9 @@ func (d *DeviceConfig) MaskedURL() string {
 	return u.String()
 }
 
-// resolve 把 onvif://、http(s):// 或裸 host:port 统一解析为 device_service URL，
+// Resolve 把 onvif://、http(s):// 或裸 host:port 统一解析为 device_service URL，
 // 并从 userinfo 中提取鉴权信息（显式 username/password 字段优先级更高）。
-func (d *DeviceConfig) resolve() error {
+func (d *DeviceConfig) Resolve() error {
 	raw := strings.TrimSpace(d.URL)
 	if raw == "" {
 		return errors.New("连接地址为空")

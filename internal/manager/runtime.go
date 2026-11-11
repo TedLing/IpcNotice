@@ -296,6 +296,13 @@ func (m *Manager) Reload() error {
 		dev := devByID[id]
 		if !desired[id] || dev == nil || w.Hash() != onvifcore.DeviceHash(dev, st) {
 			w.Stop()
+			// Stop 超时意味着旧 worker 的限时收尾（残留清理/退订）尚未结束。
+			// retired 标志已阻止它创建/续约订阅，但若该设备仍需要监听而立即
+			// 创建新 worker，存在短暂的并发退订窗口——记录告警以便排查。
+			if w.StopTimedOut() {
+				m.log.Warn("旧订阅 Worker 退出超时，已启动/继续配置新 Worker；旧 Worker 的限时收尾可能仍在后台进行（不会创建新订阅）",
+					"device", w.Device().Name)
+			}
 			delete(workers, id)
 		} else {
 			w.RefreshDevice(dev)

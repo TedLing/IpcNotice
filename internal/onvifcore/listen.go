@@ -79,7 +79,9 @@ func DeviceHash(dev *config.DeviceConfig, st config.Settings) string {
 //
 // 并发契约：同一摄像头同一时间只有一个 worker（Manager.Reload 以 id 为键管理，
 // 且先 stop() 等待旧 worker 退出再创建新 worker）；retired 标志保证 stop()
-// 超时后旧 worker 也不会再发起任何新的订阅创建/续约动作。
+// 超时后旧 worker 也不会再发起任何新的订阅创建/续约动作，且停止路径上的
+// 清理/退订都有总时间预算（< stopWait），理论上 Stop 不会超时——万一超时，
+// Reload 会记录告警：限时收尾可能在新 worker 启动后短暂重叠（仅退订类请求）。
 // token（c<id>）只负责「摄像头身份 → 回调路由」；同一摄像头的多个订阅
 // （如崩溃残留的旧订阅）可能同时向同一回调 URL 推送，由 NotifyServer 全部
 // 接收并交给去重逻辑处理，与订阅实例无关。
@@ -92,7 +94,8 @@ type CameraWorker struct {
 	done     chan struct{}
 	cameraID int64
 
-	retired atomic.Bool // stop() 后置位：不再允许创建/续约订阅
+	retired      atomic.Bool // stop() 后置位：不再允许创建/续约订阅
+	stopTimedOut atomic.Bool // Stop 等待超时置位：收尾工作尚未结束（Reload 据此知情）
 
 	staleWarnOnce sync.Once // 残留订阅清理失败只告警一次，避免重连风暴刷屏
 	startOnce     sync.Once // Start 只允许启动一次 run/healthLoop，防止重复健康检查协程
@@ -102,11 +105,15 @@ type CameraWorker struct {
 	kick chan struct{}
 
 	// 运行时订阅管理地址状态（subMgrMu 保护）：
-	// curSubMgr 是当前活跃 Push 订阅的设备端管理地址——订阅成功时更新，
-	// 不依赖内存 dev.SubManager（DB 更新后内存副本并不会同步）；
-	// staleRefs 是本进程内已知待清理的订阅引用（退订失败累积），设备订阅槽
-	// 有限且 TTL 实现不规范时，逐个重连重试清理，避免新订阅把唯一保存的
+	// curSubMgr 是当前活跃 Push 订阅的设备端管理地址——订阅成功时更新；
+	// staleRefs 是已知待清理的订阅引用（崩溃恢复快照 + 退订失败累积），设备
+	// 订阅槽有限且 TTL 实现不规范时，逐个重连重试清理，避免新订阅把唯一保存的
 	// 旧地址覆盖掉。数据库仍负责跨进程重启恢复（值为空格分隔的引用列表）。
+	//
+	// 注意：内存 dev.SubManager 只是 Worker 创建时从数据库读出的静态快照，
+	// DB 更新后不会同步——它仅在 Worker 创建时用于初始化 staleRefs 一次，
+	// 之后一律以 curSubMgr/staleRefs 为准（清理结果变化后写回 DB），
+	// 绝不在每次重连时回读快照，否则已清理成功的旧引用会被反复带回重试。
 	subMgrMu  sync.Mutex
 	curSubMgr string
 	staleRefs []string
@@ -123,6 +130,10 @@ const (
 	backoffInitial   = 3 * time.Second   // 重连退避初值
 	backoffMax       = 120 * time.Second // 重连退避上限，恢复成功后重置
 	backoffResetAge  = 60 * time.Second  // 订阅存活超过该时长后再次失败，退避重置
+
+	staleCleanBudget = 10 * time.Second // 残留清理总时间预算（须小于 Stop 等待上限）
+	staleCleanPerRef = 6 * time.Second  // 单个引用的清理超时（受总预算约束）
+	stopWait         = 12 * time.Second // Stop 等待 worker 退出的上限
 )
 
 func NewCameraWorker(host WorkerHost, dev *config.DeviceConfig, hash string, cameraID int64) *CameraWorker {
@@ -131,6 +142,9 @@ func NewCameraWorker(host WorkerHost, dev *config.DeviceConfig, hash string, cam
 		host: host, hash: hash, ctx: ctx, cancel: cancel, cameraID: cameraID,
 		done: make(chan struct{}),
 		kick: make(chan struct{}, 1),
+		// 跨进程崩溃恢复：DB 快照只在创建时初始化运行态待清理列表一次，
+		// 之后由 curSubMgr/staleRefs 独立管理（见结构体注释）。
+		staleRefs: splitSubMgrRefs(dev.SubManager),
 		status: WorkerStatus{
 			CameraID:     cameraID,
 			Device:       dev.Name,
@@ -241,11 +255,18 @@ func (w *CameraWorker) moveCurToStale() {
 
 // persistSubMgrState 把「当前订阅 + 待清理引用」整体持久化到数据库。
 // 旧版本只存单个地址；新值为空格分隔列表，跨重启恢复时逐个尝试清理。
-func (w *CameraWorker) persistSubMgrState() {
+// stage 标注调用阶段（subscribe/unsubscribe/unsubscribe_fail），便于排查。
+// 写库失败只记录错误、不阻断当前订阅运行，但必须可观测——否则新订阅建立
+// 成功而持久化失败时，进程崩溃后将丢失该订阅的清理地址（残留占用订阅槽）。
+func (w *CameraWorker) persistSubMgrState(stage string) {
 	w.subMgrMu.Lock()
 	val := joinSubMgrRefs(w.curSubMgr, w.staleRefs)
+	dev := w.Device()
 	w.subMgrMu.Unlock()
-	_ = w.host.Store().SetCameraSubManager(w.Device().ID, val)
+	if err := w.host.Store().SetCameraSubManager(dev.ID, val); err != nil {
+		w.logger().Error("订阅管理地址持久化失败（进程重启后无法恢复引用，残留订阅可能占用设备订阅槽）",
+			"device", dev.Name, "stage", stage, "err", err)
+	}
 }
 
 // recordCreate 记录一次订阅创建结果；成功即证明设备可达，同步健康探测状态。
@@ -439,7 +460,7 @@ func (w *CameraWorker) serveOnce() error {
 			// 记录当前订阅管理地址并持久化（新地址 + 仍未清理的残留引用列表）：
 			// 进程崩溃后，下次启动可据此逐个退订残留订阅。
 			w.setCurSubMgr(sub.ManagerAddress)
-			w.persistSubMgrState()
+			w.persistSubMgrState("subscribe")
 			w.recordCreate(nowStr(), true)
 			w.recordSubManager(sub.ManagerAddress)
 			w.setStatus("push", true, "")
@@ -496,25 +517,40 @@ func (w *CameraWorker) serveOnce() error {
 }
 
 // Stop 先停发新动作，再取消上下文等待 worker 退出。
+// 等待上限 stopWait 覆盖了停止路径上的全部收尾动作（残留清理总预算
+// staleCleanBudget、退订 8s+3s 回退），正常情况下超时不会触发；一旦触发，
+// 置位 stopTimedOut 供 Manager.Reload 知情——retired 已阻止旧 worker 创建/
+// 续约订阅，但其限时收尾（退订/清理）可能仍在新 Worker 启动后短暂重叠。
 func (w *CameraWorker) Stop() {
 	w.retired.Store(true) // 先停发新动作，再取消上下文等待退出
 	w.cancel()
 	select {
 	case <-w.done:
-	case <-time.After(12 * time.Second):
-		w.logger().Warn("设备订阅退出超时", "device", w.Device().Name)
+	case <-time.After(stopWait):
+		w.stopTimedOut.Store(true)
+		w.logger().Warn("设备订阅退出超时（收尾工作可能仍在后台限时进行）",
+			"device", w.Device().Name)
 	}
 	w.setStatus("", false, "已停止")
 }
 
+// StopTimedOut 报告最近一次 Stop 是否等待超时。
+func (w *CameraWorker) StopTimedOut() bool { return w.stopTimedOut.Load() }
+
 // unsubscribeStale 尽力退订所有已知的残留 Push 订阅。
-// 引用来源（去重）：① worker 运行时待清理列表 staleRefs（退订失败累积）；
-// ② 当前订阅地址 curSubMgr（重连场景下可能仍在）；③ 数据库 cameras.sub_manager
-// （跨进程崩溃恢复，值为空格分隔的引用列表）。ONVIF 退订必须持有该地址
-// （wsnt:Unsubscribe 发往 SubscribeResponse 返回的 SubscriptionManager 端点），
-// 绝不向回调 URL（ConsumerReference）发退订。
+// 引用来源（去重）：① worker 运行时待清理列表 staleRefs（含创建时从 DB
+// 快照初始化的崩溃残留）；② 当前订阅地址 curSubMgr（重连场景下可能仍在）。
+// 内存 dev.SubManager 不作为来源——它只是 Worker 创建时的静态快照，DB 更新
+// 后不会同步，回读会把已清理成功的旧引用在每次重连时反复带回重试。
+// ONVIF 退订必须持有该地址（wsnt:Unsubscribe 发往 SubscribeResponse 返回的
+// SubscriptionManager 端点），绝不向回调 URL（ConsumerReference）发退订。
 // 清理失败的引用保留在 staleRefs 随重连重试；设备重启后地址会永久失效，
 // 此时只能断电重启摄像头清理。
+//
+// 生命周期约束：整个清理过程受总时间预算 staleCleanBudget 约束（小于
+// Stop 的等待上限），且每轮清理前检查 retired——保证旧 Worker 不会越过
+// Stop() 边界仍在清理（否则 Reload 超时后启动新 Worker，新旧可能同时对
+// 设备退订）。Stop 之后的收尾清理仍尽力完成（WithoutCancel），只是限时。
 func (w *CameraWorker) unsubscribeStale(cli *onvif.Client) {
 	dev := w.Device()
 	w.subMgrMu.Lock()
@@ -525,7 +561,7 @@ func (w *CameraWorker) unsubscribeStale(cli *onvif.Client) {
 	w.subMgrMu.Unlock()
 	seen := map[string]bool{}
 	var unique []string
-	for _, r := range append(refs, splitSubMgrRefs(dev.SubManager)...) {
+	for _, r := range refs {
 		if r == "" || seen[r] {
 			continue
 		}
@@ -536,10 +572,25 @@ func (w *CameraWorker) unsubscribeStale(cli *onvif.Client) {
 		return
 	}
 
+	deadline := time.Now().Add(staleCleanBudget)
 	var remaining []string
 	cleaned := 0
 	for _, ref := range unique {
-		ctx, cancel := context.WithTimeout(context.WithoutCancel(w.ctx), 6*time.Second)
+		// 已停用或预算耗尽：未清理的引用保留待重试（写回 DB 交给后续
+		// 重连或下一个 Worker 接手），不再发起新的清理请求。
+		if w.retired.Load() {
+			remaining = append(remaining, ref)
+			continue
+		}
+		left := time.Until(deadline)
+		if left <= 0 {
+			remaining = append(remaining, ref)
+			continue
+		}
+		if left > staleCleanPerRef {
+			left = staleCleanPerRef
+		}
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(w.ctx), left)
 		err := cli.Events().UnsubscribePush(ctx, ref)
 		cancel()
 		if err == nil {
@@ -569,7 +620,10 @@ func (w *CameraWorker) unsubscribeStale(cli *onvif.Client) {
 		w.recordUnsub("")
 	}
 	// 数据库只保留仍待清理的引用（新订阅建立后会写入「新地址+待清理列表」）。
-	_ = w.host.Store().SetCameraSubManager(dev.ID, strings.Join(remaining, " "))
+	if err := w.host.Store().SetCameraSubManager(dev.ID, strings.Join(remaining, " ")); err != nil {
+		w.logger().Error("残留订阅清理结果持久化失败（重启后无法恢复待清理引用）",
+			"device", dev.Name, "stage", "unsubscribe_stale", "err", err)
+	}
 }
 
 // unsubscribeBestEffort 退订一次 Push 订阅并记录诊断结果。
@@ -577,7 +631,8 @@ func (w *CameraWorker) unsubscribeStale(cli *onvif.Client) {
 // 符合 WS-BaseNotification 语义，也覆盖 TP-Link 等把引用编进 URL 的固件）；
 // 部分设备不下发 SubscriptionManager，库已回退为 SubscriptionReference.Address——
 // 本函数在此基础上再做一层保险：管理地址退订失败且两者不同时，改用
-// SubscriptionReference 再试一次。返回最终是否成功。
+// SubscriptionReference 再试一次。两次超时合计（8s+3s）小于 Stop 等待上限，
+// 保证停止路径的收尾不会越过 Worker 生命周期边界。返回最终是否成功。
 func (w *CameraWorker) unsubscribeBestEffort(svc *events.Service, sub *events.PushSubscription) bool {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(w.ctx), 8*time.Second)
 	defer cancel()
@@ -586,7 +641,7 @@ func (w *CameraWorker) unsubscribeBestEffort(svc *events.Service, sub *events.Pu
 		sub.SubscriptionReference != sub.ManagerAddress {
 		w.logger().Debug("按订阅管理地址退订失败，回退 SubscriptionReference 重试",
 			"device", w.Device().Name, "err", err)
-		ctx2, cancel2 := context.WithTimeout(context.WithoutCancel(w.ctx), 8*time.Second)
+		ctx2, cancel2 := context.WithTimeout(context.WithoutCancel(w.ctx), 3*time.Second)
 		defer cancel2()
 		err = svc.UnsubscribePush(ctx2, sub.SubscriptionReference)
 	}
@@ -649,10 +704,10 @@ func (w *CameraWorker) runPushLease(svc *events.Service, sub *events.PushSubscri
 	// 失败则把地址转入待清理列表，随重连/下次启动重试。
 	if w.unsubscribeBestEffort(svc, sub) {
 		w.clearCurSubMgr()
-		w.persistSubMgrState()
+		w.persistSubMgrState("unsubscribe")
 	} else {
 		w.moveCurToStale()
-		w.persistSubMgrState()
+		w.persistSubMgrState("unsubscribe_fail")
 		if w.ctx.Err() == nil {
 			w.logger().Warn("Push 退订失败，订阅地址转入待清理列表随重连重试",
 				"device", w.Device().Name)

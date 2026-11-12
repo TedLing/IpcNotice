@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -51,6 +53,13 @@ func (c Camera) Device() (*config.DeviceConfig, error) {
 	return d, nil
 }
 
+// 通道推送时间窗口默认值：全周、全天（不限制）。
+const (
+	DefaultWeekdays  = "1,2,3,4,5,6,7"
+	DefaultStartTime = "00:00:00"
+	DefaultEndTime   = "23:59:59"
+)
+
 // WebhookChannel 是一条通知渠道。
 type WebhookChannel struct {
 	ID      int64             `json:"id"`
@@ -58,9 +67,15 @@ type WebhookChannel struct {
 	URL     string            `json:"url"`
 	Method  string            `json:"method"`
 	Headers map[string]string `json:"headers"`
-	// BodyTemplate 是用户自定义的请求体模板（JSON 文本，占位符仅支持 {title} / {content}）。
+	// BodyTemplate 是用户自定义的请求体模板（JSON 文本，占位符见 dispatch.RenderBodyTemplate）。
 	// 留空时推送完整事件 JSON（向后兼容）。
-	BodyTemplate   string `json:"body_template"`
+	BodyTemplate string `json:"body_template"`
+	// 允许推送的时间窗口（按北京时间 UTC+8 判断）：Weekdays 用 ISO 编号
+	// 1=周一 ... 7=周日，nil/空等价于全周（兼容旧数据）；StartTime/EndTime
+	// 为 HH:mm:ss 闭区间，默认 00:00:00 - 23:59:59。窗口外的事件仅落库、不推送。
+	Weekdays       []int  `json:"weekdays"`
+	StartTime      string `json:"start_time"`
+	EndTime        string `json:"end_time"`
 	Enabled        bool   `json:"enabled"`
 	TimeoutSeconds int    `json:"timeout_seconds"`
 	LastTestAt     string `json:"last_test_at"`
@@ -222,6 +237,9 @@ CREATE TABLE IF NOT EXISTS webhook_channels (
   method TEXT NOT NULL DEFAULT 'POST',
   headers_json TEXT NOT NULL DEFAULT '{}',
   body_template TEXT NOT NULL DEFAULT '',
+  weekdays TEXT NOT NULL DEFAULT '1,2,3,4,5,6,7',
+  start_time TEXT NOT NULL DEFAULT '00:00:00',
+  end_time TEXT NOT NULL DEFAULT '23:59:59',
   enabled INTEGER NOT NULL DEFAULT 1,
   timeout_seconds INTEGER NOT NULL DEFAULT 5,
   last_test_at TEXT NOT NULL DEFAULT '',
@@ -302,6 +320,9 @@ CREATE INDEX IF NOT EXISTS idx_subs_camera ON event_subscriptions(camera_id);
 		return err
 	}
 	if err := s.ensureSubscriptionModeColumns(); err != nil {
+		return err
+	}
+	if err := s.ensureChannelWindowColumns(); err != nil {
 		return err
 	}
 	if _, err := s.Settings(); err != nil {
@@ -446,6 +467,21 @@ func (s *Store) ensureColumn(table, column, ddl string) error {
 		return fmt.Errorf("为 %s 增加 %s 列失败: %w", table, column, err)
 	}
 	return nil
+}
+
+// ensureChannelWindowColumns 幂等地为旧数据库补上通道的推送时间窗口列。
+// 默认值（全周、全天）保证旧通道升级后行为完全不变。
+func (s *Store) ensureChannelWindowColumns() error {
+	if err := s.ensureColumn("webhook_channels", "weekdays",
+		`ALTER TABLE webhook_channels ADD COLUMN weekdays TEXT NOT NULL DEFAULT '1,2,3,4,5,6,7'`); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("webhook_channels", "start_time",
+		`ALTER TABLE webhook_channels ADD COLUMN start_time TEXT NOT NULL DEFAULT '00:00:00'`); err != nil {
+		return err
+	}
+	return s.ensureColumn("webhook_channels", "end_time",
+		`ALTER TABLE webhook_channels ADD COLUMN end_time TEXT NOT NULL DEFAULT '23:59:59'`)
 }
 
 // ensureSubscriptionModeColumns 幂等地为旧数据库补上订阅的持续事件模式字段。
@@ -648,11 +684,88 @@ func (s *Store) SetCameraSubManager(id int64, ref string) error {
 
 // ---------------- webhook channels ----------------
 
+func defaultWeekdays() []int { return []int{1, 2, 3, 4, 5, 6, 7} }
+
+// NormalizeWindow 校验并归一化通道的推送时间窗口。空值统一按「全周全天」
+// 处理，保证旧库与不带这些字段的旧前端行为不变；重复日期去重并排序。
+// 「一天都不选」由前端阻止；后端不提供「永不推送」语义（用 enabled=false）。
+// 幂等，可在 API 校验与 store 写入前各调用一次。
+func (c *WebhookChannel) NormalizeWindow() error {
+	seen := map[int]bool{}
+	days := make([]int, 0, len(c.Weekdays))
+	for _, d := range c.Weekdays {
+		if d < 1 || d > 7 {
+			return fmt.Errorf("推送日期非法: %d（1=周一 ... 7=周日）", d)
+		}
+		if !seen[d] {
+			seen[d] = true
+			days = append(days, d)
+		}
+	}
+	if len(days) == 0 {
+		days = defaultWeekdays()
+	}
+	sort.Ints(days)
+	c.Weekdays = days
+	c.StartTime = strings.TrimSpace(c.StartTime)
+	c.EndTime = strings.TrimSpace(c.EndTime)
+	if c.StartTime == "" {
+		c.StartTime = DefaultStartTime
+	}
+	if c.EndTime == "" {
+		c.EndTime = DefaultEndTime
+	}
+	if !validClock(c.StartTime) || !validClock(c.EndTime) {
+		return errors.New("推送时间格式须为 HH:mm:ss（00:00:00 - 23:59:59）")
+	}
+	if c.StartTime > c.EndTime {
+		return errors.New("推送开始时间不能晚于结束时间（暂不支持跨天时段）")
+	}
+	return nil
+}
+
+// validClock 严格校验 HH:mm:ss（补零、24 小时制）。
+func validClock(s string) bool {
+	if len(s) != 8 {
+		return false
+	}
+	t, err := time.Parse("15:04:05", s)
+	return err == nil && t.Format("15:04:05") == s
+}
+
+func encodeWeekdays(days []int) string {
+	parts := make([]string, 0, len(days))
+	for _, d := range days {
+		parts = append(parts, strconv.Itoa(d))
+	}
+	return strings.Join(parts, ",")
+}
+
+// decodeWeekdays 解析 DB 中的逗号分隔列表；空值/脏数据一律回退为全周。
+func decodeWeekdays(s string) []int {
+	out := []int{}
+	seen := map[int]bool{}
+	for _, p := range strings.Split(s, ",") {
+		n, err := strconv.Atoi(strings.TrimSpace(p))
+		if err != nil || n < 1 || n > 7 || seen[n] {
+			continue
+		}
+		seen[n] = true
+		out = append(out, n)
+	}
+	if len(out) == 0 {
+		return defaultWeekdays()
+	}
+	sort.Ints(out)
+	return out
+}
+
 func scanChannel(row interface{ Scan(...any) error }) (WebhookChannel, error) {
 	var c WebhookChannel
-	var headers string
+	var headers, weekdays string
 	var enabled, testOK int
-	err := row.Scan(&c.ID, &c.Name, &c.URL, &c.Method, &headers, &c.BodyTemplate, &enabled,
+	err := row.Scan(&c.ID, &c.Name, &c.URL, &c.Method, &headers, &c.BodyTemplate,
+		&weekdays, &c.StartTime, &c.EndTime, &enabled,
 		&c.TimeoutSeconds, &c.LastTestAt, &testOK, &c.LastTestMsg, &c.CreatedAt, &c.UpdatedAt)
 	if err != nil {
 		return c, err
@@ -666,11 +779,18 @@ func scanChannel(row interface{ Scan(...any) error }) (WebhookChannel, error) {
 	if c.Headers == nil {
 		c.Headers = map[string]string{}
 	}
+	c.Weekdays = decodeWeekdays(weekdays)
+	if !validClock(c.StartTime) {
+		c.StartTime = DefaultStartTime
+	}
+	if !validClock(c.EndTime) {
+		c.EndTime = DefaultEndTime
+	}
 	return c, nil
 }
 
-const channelColumns = `id,name,url,method,headers_json,body_template,enabled,timeout_seconds,
- last_test_at,last_test_ok,last_test_msg,created_at,updated_at`
+const channelColumns = `id,name,url,method,headers_json,body_template,weekdays,start_time,end_time,
+ enabled,timeout_seconds,last_test_at,last_test_ok,last_test_msg,created_at,updated_at`
 
 func (s *Store) ListChannels() ([]WebhookChannel, error) {
 	rows, err := s.db.Query(`SELECT ` + channelColumns + ` FROM webhook_channels ORDER BY id`)
@@ -701,6 +821,9 @@ func (s *Store) CreateChannel(c *WebhookChannel) error {
 	if c.URL == "" {
 		return errors.New("通道 URL 不能为空")
 	}
+	if err := c.NormalizeWindow(); err != nil {
+		return err
+	}
 	if c.Method == "" {
 		c.Method = httpMethodPost
 	}
@@ -710,10 +833,12 @@ func (s *Store) CreateChannel(c *WebhookChannel) error {
 	headers, _ := json.Marshal(c.Headers)
 	c.CreatedAt, c.UpdatedAt = now(), now()
 	res, err := s.db.Exec(`INSERT INTO webhook_channels
-		(name,url,method,headers_json,body_template,enabled,timeout_seconds,created_at,updated_at)
-		VALUES(?,?,?,?,?,?,?,?,?)`,
-		c.Name, c.URL, c.Method, string(headers), c.BodyTemplate, b2i(c.Enabled), c.TimeoutSeconds,
-		c.CreatedAt, c.UpdatedAt)
+		(name,url,method,headers_json,body_template,weekdays,start_time,end_time,
+		 enabled,timeout_seconds,created_at,updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
+		c.Name, c.URL, c.Method, string(headers), c.BodyTemplate,
+		encodeWeekdays(c.Weekdays), c.StartTime, c.EndTime,
+		b2i(c.Enabled), c.TimeoutSeconds, c.CreatedAt, c.UpdatedAt)
 	if err != nil {
 		return err
 	}
@@ -722,11 +847,16 @@ func (s *Store) CreateChannel(c *WebhookChannel) error {
 }
 
 func (s *Store) UpdateChannel(c *WebhookChannel) error {
+	if err := c.NormalizeWindow(); err != nil {
+		return err
+	}
 	headers, _ := json.Marshal(c.Headers)
 	c.UpdatedAt = now()
 	_, err := s.db.Exec(`UPDATE webhook_channels SET name=?,url=?,method=?,headers_json=?,body_template=?,
-		enabled=?,timeout_seconds=?,updated_at=? WHERE id=?`,
-		c.Name, c.URL, c.Method, string(headers), c.BodyTemplate, b2i(c.Enabled), c.TimeoutSeconds, c.UpdatedAt, c.ID)
+		weekdays=?,start_time=?,end_time=?,enabled=?,timeout_seconds=?,updated_at=? WHERE id=?`,
+		c.Name, c.URL, c.Method, string(headers), c.BodyTemplate,
+		encodeWeekdays(c.Weekdays), c.StartTime, c.EndTime,
+		b2i(c.Enabled), c.TimeoutSeconds, c.UpdatedAt, c.ID)
 	return err
 }
 

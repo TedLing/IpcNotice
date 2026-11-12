@@ -134,7 +134,15 @@ const (
 	staleCleanBudget = 10 * time.Second // 残留清理总时间预算（须小于 Stop 等待上限）
 	staleCleanPerRef = 6 * time.Second  // 单个引用的清理超时（受总预算约束）
 	stopWait         = 12 * time.Second // Stop 等待 worker 退出的上限
-	renewExitWait    = 3 * time.Second  // 退订前等待续约协程退出的上限（见 runPushLease）
+
+	// Push 订阅收尾（等待续约退出 → 首次退订 → 备用地址退订）共用一个
+	// 绝对截止时间：总预算 11s < stopWait 12s，留 1s 给 run() 退出。
+	// 每个阶段只从「剩余预算」里取时间，阶段上限不再简单相加，从而保证
+	// 最坏情况下后台收尾也不会越过 Stop 的生命周期边界。
+	pushTeardownBudget = 11 * time.Second
+	renewExitWait      = 3 * time.Second
+	unsubPrimaryMax    = 8 * time.Second
+	unsubFallbackMax   = 3 * time.Second
 )
 
 func NewCameraWorker(host WorkerHost, dev *config.DeviceConfig, hash string, cameraID int64) *CameraWorker {
@@ -627,24 +635,71 @@ func (w *CameraWorker) unsubscribeStale(cli *onvif.Client) {
 	}
 }
 
-// unsubscribeBestEffort 退订一次 Push 订阅并记录诊断结果。
+// budgetFor 返回在 deadline 之前本阶段最多还能占用的时长（不超过 max）。
+// 返回 0 表示收尾总预算已耗尽，不应再发起新的收尾请求。
+func budgetFor(deadline time.Time, max time.Duration) time.Duration {
+	left := time.Until(deadline)
+	if left <= 0 {
+		return 0
+	}
+	if left > max {
+		return max
+	}
+	return left
+}
+
+// waitRenewExit 在收尾总预算内等待续约协程退出，返回是否正常退出。
+// 超时是有意的取舍：底层 HTTP 若完全不响应 Context，无限等待会让 Worker
+// 永远无法停止；此时优先保证 Worker 能退出。旧 Renew 请求可能仍在后台、
+// 稍后返回，因此日志必须带设备名与订阅管理地址/引用地址便于定位异常设备。
+func (w *CameraWorker) waitRenewExit(done <-chan struct{}, deadline time.Time, sub *events.PushSubscription) bool {
+	wait := budgetFor(deadline, renewExitWait)
+	if wait <= 0 {
+		return false
+	}
+	select {
+	case <-done:
+		return true
+	case <-time.After(wait):
+		w.logger().Warn("续约协程退出超时，继续执行退订（在途 Renew 可能稍后返回，与 Unsubscribe 短暂并发）",
+			"device", w.Device().Name, "manager", sub.ManagerAddress,
+			"subscription_reference", sub.SubscriptionReference, "wait", wait.String())
+		return false
+	}
+}
+
+// unsubscribeWithDeadline 在收尾总预算内尽力退订一次 Push 订阅并记录诊断结果。
 // 优先使用 SubscribeResponse.SubscriptionManager.Address（即设备端订阅管理端点，
 // 符合 WS-BaseNotification 语义，也覆盖 TP-Link 等把引用编进 URL 的固件）；
 // 部分设备不下发 SubscriptionManager，库已回退为 SubscriptionReference.Address——
-// 本函数在此基础上再做一层保险：管理地址退订失败且两者不同时，改用
-// SubscriptionReference 再试一次。两次超时合计（8s+3s）小于 Stop 等待上限，
-// 保证停止路径的收尾不会越过 Worker 生命周期边界。返回最终是否成功。
-func (w *CameraWorker) unsubscribeBestEffort(svc *events.Service, sub *events.PushSubscription) bool {
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(w.ctx), 8*time.Second)
+// 本函数在此基础上再做一层保险：管理地址退订失败且两者不同时，若还有剩余
+// 预算则改用 SubscriptionReference 再试一次。首次退订与备用退订共享同一
+// deadline，各自只取剩余预算，保证「等待续约退出 + 两次退订」总耗时
+// ≤ pushTeardownBudget(11s) < stopWait(12s)。返回最终是否成功。
+func (w *CameraWorker) unsubscribeWithDeadline(svc *events.Service, sub *events.PushSubscription, deadline time.Time) bool {
+	primary := budgetFor(deadline, unsubPrimaryMax)
+	if primary <= 0 {
+		w.logger().Warn("Push 退订收尾预算耗尽，跳过退订（引用转入待清理列表）",
+			"device", w.Device().Name, "manager", sub.ManagerAddress)
+		w.recordUnsub("退订收尾预算耗尽")
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(w.ctx), primary)
 	defer cancel()
 	err := svc.UnsubscribePush(ctx, sub.ManagerAddress)
 	if err != nil && sub.SubscriptionReference != "" &&
 		sub.SubscriptionReference != sub.ManagerAddress {
 		w.logger().Debug("按订阅管理地址退订失败，回退 SubscriptionReference 重试",
 			"device", w.Device().Name, "err", err)
-		ctx2, cancel2 := context.WithTimeout(context.WithoutCancel(w.ctx), 3*time.Second)
-		defer cancel2()
-		err = svc.UnsubscribePush(ctx2, sub.SubscriptionReference)
+		fallback := budgetFor(deadline, unsubFallbackMax)
+		if fallback <= 0 {
+			w.logger().Warn("Push 备用地址退订预算耗尽，跳过",
+				"device", w.Device().Name, "subscription_reference", sub.SubscriptionReference)
+		} else {
+			ctx2, cancel2 := context.WithTimeout(context.WithoutCancel(w.ctx), fallback)
+			err = svc.UnsubscribePush(ctx2, sub.SubscriptionReference)
+			cancel2()
+		}
 	}
 	if err != nil {
 		w.recordUnsub(err.Error())
@@ -700,21 +755,18 @@ func (w *CameraWorker) runPushLease(svc *events.Service, sub *events.PushSubscri
 	case <-done:
 	case <-w.ctx.Done():
 	}
+	// 收尾全过程统一截止时间（与 stopWait 闭合）：等待续约退出、首次退订、
+	// 备用地址退订都只从剩余预算中取时间，最坏 11s < Stop 的 12s 等待上限。
+	deadline := time.Now().Add(pushTeardownBudget)
 	cancel()
 	// 等续约协程真正退出后再退订，避免 RenewPush 与 UnsubscribePush 同时
 	// 操作同一个订阅（cancel() 只是通知，不等于协程已退出）。正常情况下
-	// RenewPush 的在途请求会随 loopCtx 取消立即中止、等待瞬间完成（若
-	// select 本就走 done 分支则立即返回）；设上限 renewExitWait 防止底层
-	// HTTP 不响应 Context 时拖穿 Stop 等待预算，超时则告警后退订。
-	select {
-	case <-done:
-	case <-time.After(renewExitWait):
-		w.logger().Warn("续约协程退出超时，继续执行退订（可能与在途续约短暂并发）",
-			"device", w.Device().Name)
-	}
+	// 在途请求随 loopCtx 取消立即中止；若底层 HTTP 不响应 Context，则有限
+	// 等待后优先保证 Worker 能退出，并记日志（含设备与订阅地址）便于定位。
+	w.waitRenewExit(done, deadline, sub)
 	// 主动退订；成功则清空当前引用并持久化（仅剩待清理列表），
 	// 失败则把地址转入待清理列表，随重连/下次启动重试。
-	if w.unsubscribeBestEffort(svc, sub) {
+	if w.unsubscribeWithDeadline(svc, sub, deadline) {
 		w.clearCurSubMgr()
 		w.persistSubMgrState("unsubscribe")
 	} else {

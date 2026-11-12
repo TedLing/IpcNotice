@@ -87,8 +87,18 @@ export interface WebhookChannel {
   /** 固定 POST */
   method: string;
   headers: Record<string, string>;
-  /** 请求体模板（JSON 文本，占位符 {title} / {content}）；{content} 为带标题头的多行文本（标题/摄像头/事件/触发时间），渲染时自动 JSON 转义；留空推送完整事件 JSON */
+  /**
+   * 请求体模板（JSON 文本）。占位符：
+   * {title} 摄像头xxx 发生-xxx事件名称、{content} 带标题头的多行文本、
+   * {devname} 设备名称、{eventname} 事件名称、{evettime}（别名 {eventtime}）触发时间。
+   * 渲染时自动 JSON 转义；留空推送完整事件 JSON
+   */
   body_template: string;
+  /** 允许推送的星期（ISO：1=周一 ... 7=周日，默认全部），按北京时间判断 */
+  weekdays: number[];
+  /** 允许推送时段的起止时间 HH:mm:ss（闭区间，默认 00:00:00 - 23:59:59） */
+  start_time: string;
+  end_time: string;
   enabled: boolean;
   timeout_seconds: number;
   last_test_at: string;

@@ -448,7 +448,15 @@ func (d *Dispatcher) handle(it dispatchItem) {
 
 	dispatched := false
 	if push {
+		now := time.Now()
 		for _, ch := range channels {
+			if !ChannelWindowAllows(ch, now) {
+				d.log.Info("webhook 处于勿扰时段，跳过推送（事件仍会落库）",
+					"channel", ch.Name, "device", evt.Device, "topic", evt.Topic,
+					"at", now.In(cst).Format("2006-01-02 15:04:05"),
+					"weekdays", ch.Weekdays, "start_time", ch.StartTime, "end_time", ch.EndTime)
+				continue
+			}
 			if d.postWebhook(evt, ch) {
 				dispatched = true
 			}
@@ -597,13 +605,40 @@ func jsonEscape(s string) string {
 	return string(b[1 : len(b)-1])
 }
 
-// RenderBodyTemplate 把请求体模板里的 {title} / {content} 占位符替换为实际内容。
+// 请求体模板支持的占位符。{eventtime} 是 {evettime} 的容错别名。
+// 用 strings.NewReplacer 一次性替换，避免链式 ReplaceAll 造成「替换值里
+// 恰好含另一个占位符文本」时被二次替换。
+var bodyPlaceholderStubs = strings.NewReplacer(
+	"{title}", "t",
+	"{content}", "c",
+	"{devname}", "d",
+	"{eventname}", "e",
+	"{evettime}", "s",
+	"{eventtime}", "s",
+)
+
+// bodyReplacer 把各占位符映射为经 JSON 转义后的实际内容：
+//   - {title}     摄像头xxx 发生-xxx事件名称（保留旧行为）
+//   - {content}   带 Emoji 标题头的多行文本（保留旧行为）
+//   - {devname}   设备名称
+//   - {eventname} 事件名称（订阅里填写的中文备注，未填时为事件主题末段）
+//   - {evettime}  触发时间（优先本机接收时间，按北京时间展示）
+func bodyReplacer(evt Event) *strings.Replacer {
+	return strings.NewReplacer(
+		"{title}", jsonEscape(PushTitle(evt)),
+		"{content}", jsonEscape(PushContent(evt)),
+		"{devname}", jsonEscape(evt.Device),
+		"{eventname}", jsonEscape(evt.Title),
+		"{evettime}", jsonEscape(FormatEventTime(evt)),
+		"{eventtime}", jsonEscape(FormatEventTime(evt)),
+	)
+}
+
+// RenderBodyTemplate 把请求体模板里的占位符替换为实际内容。
 // 模板本身是 JSON 文本，占位符写在字符串值里；替换值先做 JSON 转义，
 // 保证多行内容（\n）、引号等不会破坏模板结构。未出现占位符则原样输出。
 func RenderBodyTemplate(tpl string, evt Event) string {
-	out := strings.ReplaceAll(tpl, "{title}", jsonEscape(PushTitle(evt)))
-	out = strings.ReplaceAll(out, "{content}", jsonEscape(PushContent(evt)))
-	return out
+	return bodyReplacer(evt).Replace(tpl)
 }
 
 // ValidBodyTemplate 校验模板（把占位符替换成普通文本后）是否为合法 JSON。
@@ -611,9 +646,7 @@ func ValidBodyTemplate(tpl string) bool {
 	if strings.TrimSpace(tpl) == "" {
 		return true
 	}
-	s := strings.ReplaceAll(tpl, "{title}", "t")
-	s = strings.ReplaceAll(s, "{content}", "c")
-	return json.Valid([]byte(s))
+	return json.Valid([]byte(bodyPlaceholderStubs.Replace(tpl)))
 }
 
 // Close 停止接收新事件，等 worker 与静默扫描协程退出后关闭文件。

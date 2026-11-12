@@ -79,12 +79,52 @@ func TestRenderBodyTemplate(t *testing.T) {
 	}
 }
 
+func TestRenderBodyTemplateNewPlaceholders(t *testing.T) {
+	evt := Event{
+		Device:     "camera-01",
+		Title:      "移动侦测",
+		ReceivedAt: "2026-11-10T08:00:01Z",
+	}
+	tpl := `{"dev":"{devname}","event":"{eventname}","time":"{evettime}","alias":"{eventtime}","title":"{title}","content":"{content}"}`
+	out := RenderBodyTemplate(tpl, evt)
+	if !json.Valid([]byte(out)) {
+		t.Fatalf("渲染结果不是合法 JSON: %q", out)
+	}
+	var m map[string]string
+	if err := json.Unmarshal([]byte(out), &m); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{
+		"dev":    "camera-01",
+		"event":  "移动侦测",
+		"time":   "2026-11-10 16:00:01",
+		"alias":  "2026-11-10 16:00:01",
+		"title":  "摄像头camera-01 发生-移动侦测",
+	}
+	for k, v := range want {
+		if m[k] != v {
+			t.Errorf("占位符 %s = %q, want %q", k, m[k], v)
+		}
+	}
+	// 一次性替换：替换值里若含另一个占位符文本，不应被二次替换。
+	evt.Device = "dev-{eventname}"
+	if got := RenderBodyTemplate(`{"d":"{devname}"}`, evt); got != `{"d":"dev-{eventname}"}` {
+		t.Errorf("替换值不应被二次替换: %q", got)
+	}
+	// 特殊字符同样保持 JSON 合法。
+	evt.Title = `带"引号"的\事件`
+	if got := RenderBodyTemplate(`{"e":"{eventname}"}`, evt); !json.Valid([]byte(got)) {
+		t.Errorf("含特殊字符时渲染结果不是合法 JSON: %q", got)
+	}
+}
+
 func TestValidBodyTemplate(t *testing.T) {
 	for _, ok := range []string{
 		"",
 		`{}`,
 		`{"title":"{title}","content":"{content}"}`,
 		`{"msgtype":"text","text":{"content":"{content}"}}`,
+		`{"dev":"{devname}","event":"{eventname}","time":"{evettime}","alias":"{eventtime}"}`,
 	} {
 		if !ValidBodyTemplate(ok) {
 			t.Errorf("应判定为合法模板: %q", ok)

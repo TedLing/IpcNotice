@@ -11,7 +11,18 @@ interface HeaderRow {
   value: string;
 }
 
-const TEMPLATE_EXAMPLE = `{"title":"{title}","content":"{content}"}`;
+const TEMPLATE_EXAMPLE = `{"title":"{title}","content":"{content}","device":"{devname}","event":"{eventname}","time":"{evettime}"}`;
+const WEEKDAYS = [
+  { label: "周一", value: 1 },
+  { label: "周二", value: 2 },
+  { label: "周三", value: 3 },
+  { label: "周四", value: 4 },
+  { label: "周五", value: 5 },
+  { label: "周六", value: 6 },
+  { label: "周日", value: 7 }
+];
+const ALL_WEEKDAYS = WEEKDAYS.map(d => d.value);
+const PLACEHOLDER_RE = /\{(?:title|content|devname|eventname|evettime|eventtime)\}/g;
 
 const loading = ref(false);
 const testing = ref(0);
@@ -22,6 +33,7 @@ const dialogVisible = ref(false);
 const editing = ref(false);
 const headerRows = ref<HeaderRow[]>([]);
 const form = reactive<Partial<WebhookChannel>>({});
+const selectedDays = ref<number[]>([...ALL_WEEKDAYS]);
 
 const errMsg = (e: any) => e?.message ?? String(e);
 const emptyForm = (): Partial<WebhookChannel> => ({
@@ -29,6 +41,9 @@ const emptyForm = (): Partial<WebhookChannel> => ({
   url: "http://127.0.0.1:8080/webhook",
   headers: {},
   body_template: "",
+  weekdays: [...ALL_WEEKDAYS],
+  start_time: "00:00:00",
+  end_time: "23:59:59",
   enabled: true,
   timeout_seconds: 5
 });
@@ -38,11 +53,25 @@ function templateValid(tpl: string): boolean {
   const t = (tpl ?? "").trim();
   if (!t) return true;
   try {
-    JSON.parse(t.replace(/\{title\}/g, "t").replace(/\{content\}/g, "c"));
+    JSON.parse(t.replace(PLACEHOLDER_RE, "x"));
     return true;
   } catch {
     return false;
   }
+}
+
+/** 列表里展示「允许推送」窗口摘要 */
+function windowLabel(row: WebhookChannel): string {
+  const days = row.weekdays?.length ? [...row.weekdays].sort((a, b) => a - b) : [...ALL_WEEKDAYS];
+  const dayText =
+    days.length === 7
+      ? "每天"
+      : days.map(d => WEEKDAYS.find(w => w.value === d)?.label ?? String(d)).join("、");
+  const start = row.start_time || "00:00:00";
+  const end = row.end_time || "23:59:59";
+  return start === "00:00:00" && end === "23:59:59"
+    ? `${dayText}（全天）`
+    : `${dayText} ${start} - ${end}`;
 }
 
 async function load() {
@@ -69,6 +98,7 @@ function toHeaders(list: HeaderRow[]): Record<string, string> {
 
 function openCreate() {
   Object.assign(form, emptyForm());
+  selectedDays.value = [...ALL_WEEKDAYS];
   headerRows.value = [{ key: "X-Source", value: "IpcNotice" }];
   editing.value = false;
   dialogVisible.value = true;
@@ -81,12 +111,20 @@ function openEdit(row: WebhookChannel) {
     url: row.url,
     enabled: row.enabled,
     timeout_seconds: row.timeout_seconds,
-    body_template: row.body_template ?? ""
+    body_template: row.body_template ?? "",
+    weekdays: row.weekdays?.length ? [...row.weekdays] : [...ALL_WEEKDAYS],
+    start_time: row.start_time || "00:00:00",
+    end_time: row.end_time || "23:59:59"
   });
+  selectedDays.value = row.weekdays?.length ? [...row.weekdays] : [...ALL_WEEKDAYS];
   headerRows.value = toHeaderRows(row.headers);
   if (!headerRows.value.length) headerRows.value = [{ key: "", value: "" }];
   editing.value = true;
   dialogVisible.value = true;
+}
+
+function selectAllDays() {
+  selectedDays.value = [...ALL_WEEKDAYS];
 }
 
 async function save(): Promise<number | null> {
@@ -100,13 +138,26 @@ async function save(): Promise<number | null> {
   }
   const tpl = (form.body_template ?? "").trim();
   if (tpl && !templateValid(tpl)) {
-    ElMessage.error("请求体模板不是合法 JSON（占位符 {title} / {content} 需写在字符串值内）");
+    ElMessage.error("请求体模板不是合法 JSON（占位符需写在字符串值内，见下方说明）");
+    return null;
+  }
+  if (!selectedDays.value.length) {
+    ElMessage.warning("请至少选择一个允许推送的星期（如需停用通道请关闭「启用」）");
+    return null;
+  }
+  const startTime = form.start_time || "00:00:00";
+  const endTime = form.end_time || "23:59:59";
+  if (startTime > endTime) {
+    ElMessage.error("推送开始时间不能晚于结束时间（暂不支持跨天时段）");
     return null;
   }
   const payload: Partial<WebhookChannel> = {
     ...form,
     body_template: tpl,
-    headers: toHeaders(headerRows.value)
+    headers: toHeaders(headerRows.value),
+    weekdays: [...selectedDays.value].sort((a, b) => a - b),
+    start_time: startTime,
+    end_time: endTime
   };
   saving.value = true;
   try {
@@ -214,7 +265,7 @@ onMounted(load);
           <div>
             <span class="font-bold">Webhook 通道</span>
             <span class="ml-3 text-xs text-gray-500">
-              事件命中订阅后以 POST 推送到所选通道；支持自定义请求头与请求体模板
+              事件命中订阅后以 POST 推送到所选通道；支持自定义请求头、请求体模板与推送时间窗口
             </span>
           </div>
           <el-button type="primary" @click="openCreate">新增通道</el-button>
@@ -241,6 +292,11 @@ onMounted(load);
                 （{{ Object.keys(row.headers).slice(0, 2).join(", ") }}）
               </span>
             </span>
+          </template>
+        </el-table-column>
+        <el-table-column label="推送时段" min-width="180">
+          <template #default="{ row }">
+            <span class="text-xs">{{ windowLabel(row) }}</span>
           </template>
         </el-table-column>
         <el-table-column label="启用" width="80" align="center">
@@ -288,6 +344,44 @@ onMounted(load);
         <el-form-item label="启用">
           <el-switch v-model="form.enabled" />
         </el-form-item>
+        <el-form-item label="推送日期">
+          <div class="w-full">
+            <el-checkbox-group v-model="selectedDays">
+              <el-checkbox-button v-for="d in WEEKDAYS" :key="d.value" :value="d.value">
+                {{ d.label }}
+              </el-checkbox-button>
+            </el-checkbox-group>
+            <el-button class="ml-3" size="small" @click="selectAllDays">全选</el-button>
+            <div class="text-xs text-gray-400">默认全部（周一至周日）；至少选择一天</div>
+          </div>
+        </el-form-item>
+        <el-form-item label="推送时段">
+          <div class="w-full">
+            <div class="flex items-center gap-2">
+              <el-time-picker
+                v-model="form.start_time"
+                value-format="HH:mm:ss"
+                format="HH:mm:ss"
+                placeholder="开始时间"
+                :clearable="false"
+                style="width: 140px"
+              />
+              <span>至</span>
+              <el-time-picker
+                v-model="form.end_time"
+                value-format="HH:mm:ss"
+                format="HH:mm:ss"
+                placeholder="结束时间"
+                :clearable="false"
+                style="width: 140px"
+              />
+            </div>
+            <div class="text-xs text-gray-400">
+              默认 00:00:00 - 23:59:59（全天）。按北京时间（UTC+8）判断，日期与时段两个条件都满足才推送；
+              窗口外为勿扰时段，事件照常记录但不外发。手动「测试推送」不受此限制。暂不支持跨天时段。
+            </div>
+          </div>
+        </el-form-item>
         <el-form-item label="自定义请求头">
           <div class="w-full">
             <div v-for="(h, i) in headerRows" :key="i" class="flex items-center gap-2 mb-2">
@@ -309,17 +403,19 @@ onMounted(load);
               :placeholder="`留空则推送完整事件 JSON。示例：\n${TEMPLATE_EXAMPLE}`"
               style="font-family: monospace"
             />
-            <div class="mt-1 flex items-center gap-2">
+            <div class="mt-1 flex items-start gap-2">
               <el-button size="small" @click="fillExample">填入示例</el-button>
-              <span class="text-xs text-gray-400">
-                占位符仅支持 {title}（摄像头xxx 发生-xxxx事件名称）与
-                {content}（带标题头的多行文本：标题 / 摄像头 / 事件 / 触发时间，渲染时自动转义为 \n）
-              </span>
+              <div class="text-xs text-gray-500 leading-5">
+                支持占位符：<code>{title}</code> 摄像头xxx 发生-xxx事件名称、<code>{content}</code>
+                带 Emoji 标题头的多行文本、<code>{devname}</code> 设备名称、<code>{eventname}</code>
+                事件名称、<code>{evettime}</code> 触发时间（别名 <code>{eventtime}</code>）。
+                渲染时自动 JSON 转义；占位符需写在 JSON 字符串值内。
+              </div>
             </div>
           </div>
         </el-form-item>
         <el-alert type="info" :closable="false" show-icon
-          title="推送固定使用 POST；自动携带 X-IpcNotice-Event-ID / Device / Topic 请求头。" />
+          title="推送固定使用 POST；自动携带 X-IpcNotice-Event-ID / Device / Topic 请求头。保存后新配置随热重载立即生效。" />
       </el-form>
       <template #footer>
         <el-button @click="dialogVisible = false">取消</el-button>

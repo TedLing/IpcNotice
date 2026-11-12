@@ -736,8 +736,11 @@ func validateChannel(c *store.WebhookChannel) error {
 	// 通道仅支持 POST
 	c.Method = http.MethodPost
 	c.BodyTemplate = strings.TrimSpace(c.BodyTemplate)
+	if err := c.NormalizeWindow(); err != nil {
+		return err
+	}
 	if !dispatch.ValidBodyTemplate(c.BodyTemplate) {
-		return errors.New("请求体模板不是合法 JSON（占位符仅支持 {title} / {content}，且需写在字符串值内）")
+		return errors.New("请求体模板不是合法 JSON（占位符需写在字符串值内，见表单说明）")
 	}
 	u, err := url.Parse(c.URL)
 	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {

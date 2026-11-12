@@ -5,9 +5,11 @@ import (
 	"log/slog"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"IpcNotice/internal/config"
 	"IpcNotice/internal/store"
+	"github.com/mickeyzzc/onvif-go/v2/events"
 	"github.com/mickeyzzc/onvif-go/v2/onvif"
 )
 
@@ -106,5 +108,52 @@ func TestJoinSubMgrRefs(t *testing.T) {
 	}
 	if joinSubMgrRefs("", nil) != "" {
 		t.Fatal("空引用应得到空字符串")
+	}
+}
+
+// TestPushTeardownBudgetClosed 验证收尾预算体系：各阶段共享同一绝对
+// 截止时间，总预算严格小于 Stop 等待上限（阶段上限相加不再顶穿 stopWait）。
+func TestPushTeardownBudgetClosed(t *testing.T) {
+	if pushTeardownBudget >= stopWait {
+		t.Fatalf("Push 收尾总预算 %s 必须小于 Stop 等待上限 %s", pushTeardownBudget, stopWait)
+	}
+	deadline := time.Now().Add(pushTeardownBudget)
+	if got := budgetFor(deadline, renewExitWait); got > renewExitWait {
+		t.Fatalf("阶段预算不得超过自身上限: %s", got)
+	}
+	if got := budgetFor(time.Now().Add(time.Second), unsubPrimaryMax); got > time.Second {
+		t.Fatalf("剩余不足时应只取剩余预算: %s", got)
+	}
+	if got := budgetFor(time.Now().Add(-time.Second), unsubFallbackMax); got != 0 {
+		t.Fatalf("截止时间已过应返回 0: %s", got)
+	}
+	// 极端情况：等待续约耗满 3s、首次退订耗满 8s 时，备用退订已无预算可用
+	//（因此必须由 budgetFor 统一裁剪，不能用固定的 3s 独立超时）。
+	lateDeadline := time.Now().Add(pushTeardownBudget - renewExitWait - unsubPrimaryMax)
+	if got := budgetFor(lateDeadline, unsubFallbackMax); got > 0 {
+		t.Fatalf("前两阶段耗尽预算后备用退订不应再获得时间: %s", got)
+	}
+}
+
+func TestWaitRenewExit(t *testing.T) {
+	w := NewCameraWorker(&fakeHost{ctx: context.Background(), log: slog.Default()},
+		&config.DeviceConfig{ID: 1, Name: "ipc-test"}, "hash", 1)
+	sub := &events.PushSubscription{ManagerAddress: "http://192.0.2.10/onvif/sub", SubscriptionReference: "http://192.0.2.10/onvif/ref"}
+
+	done := make(chan struct{})
+	close(done)
+	if !w.waitRenewExit(done, time.Now().Add(pushTeardownBudget), sub) {
+		t.Fatal("已退出的续约协程应立即返回 true")
+	}
+	if w.waitRenewExit(make(chan struct{}), time.Now().Add(-time.Second), sub) {
+		t.Fatal("预算耗尽时应返回 false")
+	}
+	// 超时路径：有限等待后放弃，不让 Worker 永远无法退出。
+	start := time.Now()
+	if w.waitRenewExit(make(chan struct{}), time.Now().Add(20*time.Millisecond), sub) {
+		t.Fatal("底层不响应取消时应超时返回 false")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("超时等待不应超过设定预算: %s", elapsed)
 	}
 }

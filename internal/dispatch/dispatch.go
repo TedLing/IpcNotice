@@ -605,7 +605,8 @@ func jsonEscape(s string) string {
 	return string(b[1 : len(b)-1])
 }
 
-// 请求体模板支持的占位符。{eventtime} 是 {evettime} 的容错别名。
+// 请求体模板支持的占位符。{eventtime} 是标准拼写，{evettime} 为兼容
+// 早期错拼模板保留的别名（旧模板不会因为改名而失效）。
 // 用 strings.NewReplacer 一次性替换，避免链式 ReplaceAll 造成「替换值里
 // 恰好含另一个占位符文本」时被二次替换。
 var bodyPlaceholderStubs = strings.NewReplacer(
@@ -613,24 +614,42 @@ var bodyPlaceholderStubs = strings.NewReplacer(
 	"{content}", "c",
 	"{devname}", "d",
 	"{eventname}", "e",
-	"{evettime}", "s",
+	"{eventstatus}", "s",
 	"{eventtime}", "s",
+	"{evettime}", "s",
 )
 
+// EventStatusText 返回 {eventstatus}：持续事件（sustained）的生命周期状态。
+// started → 开始事件，ended → 结束事件；即时事件 / 测试推送没有生命周期，
+// 返回「事件」，使 `{eventname}的{eventstatus}` 这类模板在任何模式下都通顺。
+func EventStatusText(evt Event) string {
+	switch evt.EventPhase {
+	case PhaseStarted:
+		return "开始事件"
+	case PhaseEnded:
+		return "结束事件"
+	default:
+		return "事件"
+	}
+}
+
 // bodyReplacer 把各占位符映射为经 JSON 转义后的实际内容：
-//   - {title}     摄像头xxx 发生-xxx事件名称（保留旧行为）
-//   - {content}   带 Emoji 标题头的多行文本（保留旧行为）
-//   - {devname}   设备名称
-//   - {eventname} 事件名称（订阅里填写的中文备注，未填时为事件主题末段）
-//   - {evettime}  触发时间（优先本机接收时间，按北京时间展示）
+//   - {title}       摄像头xxx 发生-xxx事件名称（保留旧行为）
+//   - {content}     带 Emoji 标题头的多行文本（保留旧行为）
+//   - {devname}     设备名称
+//   - {eventname}   事件名称（订阅里填写的中文备注，未填时为事件主题末段）
+//   - {eventstatus} 开始事件 / 结束事件 / 事件（无生命周期时）
+//   - {eventtime}   触发时间（优先本机接收时间，按北京时间展示）
+//   - {evettime}    同 {eventtime}，兼容早期错拼模板
 func bodyReplacer(evt Event) *strings.Replacer {
 	return strings.NewReplacer(
 		"{title}", jsonEscape(PushTitle(evt)),
 		"{content}", jsonEscape(PushContent(evt)),
 		"{devname}", jsonEscape(evt.Device),
 		"{eventname}", jsonEscape(evt.Title),
-		"{evettime}", jsonEscape(FormatEventTime(evt)),
+		"{eventstatus}", jsonEscape(EventStatusText(evt)),
 		"{eventtime}", jsonEscape(FormatEventTime(evt)),
+		"{evettime}", jsonEscape(FormatEventTime(evt)),
 	)
 }
 

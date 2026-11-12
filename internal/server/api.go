@@ -764,12 +764,14 @@ func (s *APIServer) testChannel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 用一条与真实推送同构的示例事件渲染请求体，让「测试推送」所见即所得。
+	// 带 started 阶段，便于预览 {eventstatus} 等生命周期占位符的实际效果。
 	evt := dispatch.Event{
 		ID:         "test-" + util.RandomToken()[:8],
 		Device:     "测试摄像头",
 		Transport:  "test",
 		Topic:      "RuleEngine/CellMotionDetector/Motion",
 		Title:      "移动侦测",
+		EventPhase: dispatch.PhaseStarted,
 		DeviceTime: time.Now().UTC().Format(time.RFC3339Nano),
 		ReceivedAt: time.Now().UTC().Format(time.RFC3339Nano),
 	}

@@ -11,7 +11,7 @@ interface HeaderRow {
   value: string;
 }
 
-const TEMPLATE_EXAMPLE = `{"title":"{title}","content":"{content}","device":"{devname}","event":"{eventname}","time":"{evettime}"}`;
+const TEMPLATE_EXAMPLE = `{"title":"{title}","content":"{content}","device":"{devname}","event":"{eventname}的{eventstatus}","time":"{eventtime}"}`;
 const WEEKDAYS = [
   { label: "周一", value: 1 },
   { label: "周二", value: 2 },
@@ -22,7 +22,7 @@ const WEEKDAYS = [
   { label: "周日", value: 7 }
 ];
 const ALL_WEEKDAYS = WEEKDAYS.map(d => d.value);
-const PLACEHOLDER_RE = /\{(?:title|content|devname|eventname|evettime|eventtime)\}/g;
+const PLACEHOLDER_RE = /\{(?:title|content|devname|eventname|eventstatus|eventtime|evettime)\}/g;
 
 const loading = ref(false);
 const testing = ref(0);
@@ -408,8 +408,10 @@ onMounted(load);
               <div class="text-xs text-gray-500 leading-5">
                 支持占位符：<code>{title}</code> 摄像头xxx 发生-xxx事件名称、<code>{content}</code>
                 带 Emoji 标题头的多行文本、<code>{devname}</code> 设备名称、<code>{eventname}</code>
-                事件名称、<code>{evettime}</code> 触发时间（别名 <code>{eventtime}</code>）。
-                渲染时自动 JSON 转义；占位符需写在 JSON 字符串值内。
+                事件名称、<code>{eventstatus}</code> 事件状态（<b>开始事件 / 结束事件</b>，普通事件为「事件」）、
+                <code>{eventtime}</code> 触发时间（兼容旧写法 <code>{evettime}</code>）。<br />
+                持续模式想显示「移动侦测的开始事件」，模板里写
+                <code>{eventname}的{eventstatus}</code> 即可。渲染时自动 JSON 转义；占位符需写在 JSON 字符串值内。
               </div>
             </div>
           </div>

@@ -85,7 +85,7 @@ func TestRenderBodyTemplateNewPlaceholders(t *testing.T) {
 		Title:      "移动侦测",
 		ReceivedAt: "2026-11-10T08:00:01Z",
 	}
-	tpl := `{"dev":"{devname}","event":"{eventname}","time":"{evettime}","alias":"{eventtime}","title":"{title}","content":"{content}"}`
+	tpl := `{"dev":"{devname}","event":"{eventname}","status":"{eventstatus}","phrase":"{eventname}的{eventstatus}","time":"{eventtime}","alias":"{evettime}","title":"{title}","content":"{content}"}`
 	out := RenderBodyTemplate(tpl, evt)
 	if !json.Valid([]byte(out)) {
 		t.Fatalf("渲染结果不是合法 JSON: %q", out)
@@ -97,6 +97,8 @@ func TestRenderBodyTemplateNewPlaceholders(t *testing.T) {
 	want := map[string]string{
 		"dev":    "camera-01",
 		"event":  "移动侦测",
+		"status": "事件",
+		"phrase": "移动侦测的事件",
 		"time":   "2026-11-10 16:00:01",
 		"alias":  "2026-11-10 16:00:01",
 		"title":  "摄像头camera-01 发生-移动侦测",
@@ -118,13 +120,60 @@ func TestRenderBodyTemplateNewPlaceholders(t *testing.T) {
 	}
 }
 
+func TestRenderBodyTemplateEventStatus(t *testing.T) {
+	base := Event{Device: "客厅摄像头", Title: "移动侦测", ReceivedAt: "2026-11-12T01:37:06Z"}
+	for _, c := range []struct {
+		phase string
+		want  string
+	}{
+		{"", "移动侦测的事件"},
+		{PhaseStarted, "移动侦测的开始事件"},
+		{PhaseEnded, "移动侦测的结束事件"},
+	} {
+		evt := base
+		evt.EventPhase = c.phase
+		out := RenderBodyTemplate(`{"event":"{eventname}的{eventstatus}"}`, evt)
+		var m map[string]string
+		if err := json.Unmarshal([]byte(out), &m); err != nil {
+			t.Fatalf("phase=%q 渲染结果不是合法 JSON: %q", c.phase, out)
+		}
+		if m["event"] != c.want {
+			t.Errorf("phase=%q 得到 %q, want %q", c.phase, m["event"], c.want)
+		}
+	}
+
+	// 用户实际使用的 markdown 模板：开始/结束两条推送必须能通过事件名区分，
+	// 且 {eventtime} 是标准写法，渲染后仍是合法 JSON。
+	tpl := `{"msgtype":"markdown","markdown":{"content":"## 通知 \n摄像头：**{devname}**\n事件：**{eventname}的{eventstatus}**\n触发时间：**{eventtime}**"}}`
+	for _, c := range []struct {
+		phase string
+		want  string
+	}{
+		{PhaseStarted, "移动侦测的开始事件"},
+		{PhaseEnded, "移动侦测的结束事件"},
+	} {
+		evt := base
+		evt.EventPhase = c.phase
+		out := RenderBodyTemplate(tpl, evt)
+		if !json.Valid([]byte(out)) {
+			t.Fatalf("phase=%q 渲染结果不是合法 JSON: %q", c.phase, out)
+		}
+		if !strings.Contains(out, c.want) || !strings.Contains(out, "2026-11-12 09:37:06") {
+			t.Errorf("phase=%q 模板渲染异常: %q", c.phase, out)
+		}
+		if strings.Contains(out, "{event") {
+			t.Errorf("phase=%q 存在未替换的占位符: %q", c.phase, out)
+		}
+	}
+}
+
 func TestValidBodyTemplate(t *testing.T) {
 	for _, ok := range []string{
 		"",
 		`{}`,
 		`{"title":"{title}","content":"{content}"}`,
 		`{"msgtype":"text","text":{"content":"{content}"}}`,
-		`{"dev":"{devname}","event":"{eventname}","time":"{evettime}","alias":"{eventtime}"}`,
+		`{"dev":"{devname}","event":"{eventname}","status":"{eventstatus}","time":"{eventtime}","alias":"{evettime}"}`,
 	} {
 		if !ValidBodyTemplate(ok) {
 			t.Errorf("应判定为合法模板: %q", ok)

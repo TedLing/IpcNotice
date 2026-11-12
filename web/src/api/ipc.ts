@@ -90,7 +90,9 @@ export interface WebhookChannel {
   /**
    * 请求体模板（JSON 文本）。占位符：
    * {title} 摄像头xxx 发生-xxx事件名称、{content} 带标题头的多行文本、
-   * {devname} 设备名称、{eventname} 事件名称、{evettime}（别名 {eventtime}）触发时间。
+   * {devname} 设备名称、{eventname} 事件名称、
+   * {eventstatus} 事件状态（开始事件/结束事件/事件）、
+   * {eventtime} 触发时间（兼容旧写法 {evettime}）。
    * 渲染时自动 JSON 转义；留空推送完整事件 JSON
    */
   body_template: string;

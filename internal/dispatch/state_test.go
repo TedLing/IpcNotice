@@ -135,19 +135,40 @@ func TestSustainedRepeatDoesNotRestart(t *testing.T) {
 	}
 }
 
-func TestSustainedExplicitFalseEndsImmediately(t *testing.T) {
+func TestSustainedExplicitFalseWaitsForConfirmation(t *testing.T) {
 	d := newSustainedDispatcher()
 	rt := sustainedTable("cam", 30, true, true)
 	s := sustainedSettingsFor(rt, "cam")
-	feed(d, sustainedEvent("cam", map[string]string{"IsMotion": "true"}), s)
-	feed(d, sustainedEvent("cam", map[string]string{"IsMotion": "false"}), s)
+	clock := time.Now()
+	d.smNow = func() time.Time { return clock }
+	on := sustainedEvent("cam", map[string]string{"IsMotion": "true"})
+	off := sustainedEvent("cam", map[string]string{"IsMotion": "false"})
 
+	feed(d, on, s)
+	clock = clock.Add(time.Second)
+	feed(d, off, s)
+	if n := len(phaseOf(lifecycleEvents(drain(d)), PhaseEnded)); n != 0 {
+		t.Fatalf("明确 false 只是结束候选，不应立即推送 ended，实际 %d", n)
+	}
+
+	// 设备停止后会连发数条 false 心跳；它们不得刷新活动计时，也不得提前结束。
+	for i := 0; i < 10; i++ {
+		clock = clock.Add(2 * time.Second)
+		feed(d, off, s)
+		d.scanInactivity()
+	}
+	if n := len(phaseOf(lifecycleEvents(drain(d)), PhaseEnded)); n != 0 {
+		t.Fatalf("未到 30 秒静默窗口不应结束，实际 %d", n)
+	}
+
+	clock = clock.Add(31 * time.Second)
+	d.scanInactivity()
 	ended := phaseOf(lifecycleEvents(drain(d)), PhaseEnded)
 	if len(ended) != 1 {
-		t.Fatalf("明确 false 应立即产生 1 条 ended，实际 %d", len(ended))
+		t.Fatalf("静默确认后应产生 1 条 ended，实际 %d", len(ended))
 	}
 	if ended[0].EndReason != EndExplicit {
-		t.Errorf("end_reason 应为 EXPLICIT_STOP，实际 %q", ended[0].EndReason)
+		t.Errorf("收到过明确停止信号时 end_reason 应为 EXPLICIT_STOP，实际 %q", ended[0].EndReason)
 	}
 	if ended[0].EndedAt == "" || ended[0].StartedAt == "" {
 		t.Errorf("ended 缺少时间字段: %+v", ended[0])
@@ -192,8 +213,9 @@ func TestSustainedInactivityTimeoutEnds(t *testing.T) {
 	if ended[0].EndReason != EndInactivity {
 		t.Errorf("end_reason 应为 INACTIVITY_TIMEOUT，实际 %q", ended[0].EndReason)
 	}
-	if ended[0].DurationSeconds < 30 {
-		t.Errorf("duration_seconds 应 >= 30，实际 %d", ended[0].DurationSeconds)
+	// 持续时间只算「开始 → 最后活动信号」，不含 30 秒结束确认窗口。
+	if ended[0].DurationSeconds != 0 {
+		t.Errorf("duration_seconds 应为 0（只有一条活动事件），实际 %d", ended[0].DurationSeconds)
 	}
 }
 
@@ -225,13 +247,31 @@ func TestSustainedNewRoundAfterEnd(t *testing.T) {
 	d := newSustainedDispatcher()
 	rt := sustainedTable("cam", 30, true, true)
 	s := sustainedSettingsFor(rt, "cam")
-	feed(d, sustainedEvent("cam", map[string]string{"IsMotion": "true"}), s)
-	feed(d, sustainedEvent("cam", map[string]string{"IsMotion": "false"}), s)
-	feed(d, sustainedEvent("cam", map[string]string{"IsMotion": "true"}), s)
+	clock := time.Now()
+	d.smNow = func() time.Time { return clock }
+	on := sustainedEvent("cam", map[string]string{"IsMotion": "true"})
+	off := sustainedEvent("cam", map[string]string{"IsMotion": "false"})
 
-	started := phaseOf(lifecycleEvents(drain(d)), PhaseStarted)
-	if len(started) != 2 {
-		t.Fatalf("结束后再次活动应产生第 2 条 started，实际 %d", len(started))
+	feed(d, on, s)
+	clock = clock.Add(time.Second)
+	feed(d, off, s) // 结束候选
+	clock = clock.Add(2 * time.Second)
+	feed(d, on, s) // 抖动恢复：取消候选，仍属本轮
+	events := lifecycleEvents(drain(d))
+	if got := len(phaseOf(events, PhaseStarted)); got != 1 {
+		t.Fatalf("抖动恢复不应产生第 2 条 started，实际 %d", got)
+	}
+
+	clock = clock.Add(31 * time.Second)
+	d.scanInactivity() // 本轮静默确认结束
+	events = append(events, lifecycleEvents(drain(d))...)
+	feed(d, on, s) // 真正的新一轮
+	events = append(events, lifecycleEvents(drain(d))...)
+	if got := len(phaseOf(events, PhaseStarted)); got != 2 {
+		t.Fatalf("结束后再次活动应产生第 2 条 started，实际 %d", got)
+	}
+	if got := len(phaseOf(events, PhaseEnded)); got != 1 {
+		t.Fatalf("全过程只应有 1 条 ended，实际 %d", got)
 	}
 }
 
@@ -239,15 +279,22 @@ func TestSustainedDeletedOperationIgnored(t *testing.T) {
 	d := newSustainedDispatcher()
 	rt := sustainedTable("cam", 30, true, true)
 	s := sustainedSettingsFor(rt, "cam")
+	clock := time.Now()
+	d.smNow = func() time.Time { return clock }
 	feed(d, sustainedEvent("cam", map[string]string{"IsMotion": "true"}), s)
 	del := sustainedEvent("cam", nil)
 	del.Operation = "Deleted"
 	feed(d, del, s) // Deleted 不视为结束
 	feed(d, sustainedEvent("cam", map[string]string{"IsMotion": "false"}), s)
+	clock = clock.Add(31 * time.Second)
+	d.scanInactivity()
 
 	events := lifecycleEvents(drain(d))
 	if got := len(phaseOf(events, PhaseEnded)); got != 1 {
-		t.Fatalf("Deleted 不应触发结束（结束后仅 1 条 ended），实际 %d", got)
+		t.Fatalf("Deleted 不应触发结束（静默确认后仅 1 条 ended），实际 %d", got)
+	}
+	if got := len(phaseOf(events, PhaseStarted)); got != 1 {
+		t.Fatalf("Deleted 不应产生额外 started，实际 %d", got)
 	}
 }
 
@@ -348,6 +395,9 @@ func TestSustainedOneHourActivityOneRound(t *testing.T) {
 	}
 	clock = clock.Add(time.Second)
 	feed(d, sustainedEvent("cam", map[string]string{"IsMotion": "false"}), s)
+	// 明确停止只是候选，由统一的静默确认窗口判定结束。
+	clock = clock.Add(31 * time.Second)
+	d.scanInactivity()
 
 	events := lifecycleEvents(drain(d))
 	started, ended := phaseOf(events, PhaseStarted), phaseOf(events, PhaseEnded)
@@ -356,11 +406,60 @@ func TestSustainedOneHourActivityOneRound(t *testing.T) {
 			len(started), len(ended))
 	}
 	if ended[0].EndReason != EndExplicit || ended[0].EventCount != 3600 {
-		// event_count 统计活动事件数，结束信号（false）本身不计入
+		// event_count 统计活动事件数，停止信号（false）本身不计入
 		t.Errorf("ended 元数据不符: reason=%q count=%d", ended[0].EndReason, ended[0].EventCount)
 	}
 	if ended[0].DurationSeconds < 3595 || ended[0].DurationSeconds > 3610 {
-		t.Errorf("duration_seconds 应约 3600，实际 %d", ended[0].DurationSeconds)
+		t.Errorf("duration_seconds 应约 3600（不含确认窗口），实际 %d", ended[0].DurationSeconds)
+	}
+}
+
+// TestSustainedMotionFlappingFoldsIntoOneRound 复刻 dist 实测日志：TP-Link
+// 每 1~2 秒上报一次 IsMotion，一次持续移动期间 true/false 反复翻转（false
+// 段最长约 16.5 秒）。inactivity_timeout=30 秒应把整段折叠成 1 对通知，
+// 而不是像修复前那样产生几十对 started/ended。
+func TestSustainedMotionFlappingFoldsIntoOneRound(t *testing.T) {
+	d := newSustainedDispatcher()
+	rt := sustainedTable("cam", 30, true, true)
+	s := sustainedSettingsFor(rt, "cam")
+	base := time.Now()
+	clock := base
+	d.smNow = func() time.Time { return clock }
+	on := sustainedEvent("cam", map[string]string{"IsMotion": "true"})
+	off := sustainedEvent("cam", map[string]string{"IsMotion": "false"})
+
+	// 键 = 相对秒，值 = 该秒上报的 IsMotion；省略的秒表示设备未上报。
+	seq := map[int]bool{
+		0: true, 1: false, 2: true, 3: true, 4: false, 6: false,
+		10: true, 11: true, 12: false, 14: false, 16: false,
+		33: true, 34: true, 36: false, 38: false, 40: true, 42: false,
+	}
+	for sec := 0; sec <= 80; sec++ {
+		clock = base.Add(time.Duration(sec) * time.Second)
+		if v, ok := seq[sec]; ok {
+			if v {
+				feed(d, on, s)
+			} else {
+				feed(d, off, s)
+			}
+		}
+		d.scanInactivity() // 模拟运行期每秒一次的结束确认扫描
+	}
+
+	events := lifecycleEvents(drain(d))
+	started, ended := phaseOf(events, PhaseStarted), phaseOf(events, PhaseEnded)
+	if len(started) != 1 || len(ended) != 1 {
+		t.Fatalf("一次持续移动（含 17 秒 false 抖动）应只产生 1 started + 1 ended，实际 %d + %d",
+			len(started), len(ended))
+	}
+	if ended[0].EndReason != EndExplicit {
+		t.Errorf("end_reason 应为 EXPLICIT_STOP，实际 %q", ended[0].EndReason)
+	}
+	if ended[0].EventCount != 8 {
+		t.Errorf("event_count 应只统计 8 条活动信号，实际 %d", ended[0].EventCount)
+	}
+	if ended[0].DurationSeconds != 40 {
+		t.Errorf("duration_seconds 应为最后活动 40 秒（不含确认窗口），实际 %d", ended[0].DurationSeconds)
 	}
 }
 
@@ -393,8 +492,12 @@ func TestSustainedNotifyFlagsOff(t *testing.T) {
 	d := newSustainedDispatcher()
 	rt := sustainedTable("cam", 30, false, false)
 	s := sustainedSettingsFor(rt, "cam")
+	clock := time.Now()
+	d.smNow = func() time.Time { return clock }
 	feed(d, sustainedEvent("cam", map[string]string{"IsMotion": "true"}), s)
 	feed(d, sustainedEvent("cam", map[string]string{"IsMotion": "false"}), s)
+	clock = clock.Add(31 * time.Second)
+	d.scanInactivity()
 	items := drain(d)
 	if got := len(lifecycleEvents(items)); got != 0 {
 		t.Fatalf("notify_start/notify_end 关闭时不应产生 webhook 通知，实际 %d 条", got)

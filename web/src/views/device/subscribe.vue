@@ -23,7 +23,7 @@ interface TopicRow {
   channelIds: number[];
   /** 事件生命周期模式：sustained（默认，持续事件状态管理）| instant（冷却去重） */
   eventMode: "instant" | "sustained";
-  /** sustained 静默超时秒数（0 = 默认 30） */
+  /** sustained 结束确认窗口秒数（0 = 默认 30；最后一次活动后静默这么久才推结束） */
   inactivityTimeout: number;
   notifyStart: boolean;
   notifyEnd: boolean;
@@ -550,20 +550,20 @@ onMounted(loadBase);
                 size="small"
                 style="width: 110px"
               >
-                <el-option label="即时（默认）" value="instant" />
+                <el-option label="即时" value="instant" />
                 <el-option label="持续（开始/结束）" value="sustained" />
               </el-select>
               <el-popover
                 v-if="row.data.eventMode === 'sustained'"
                 trigger="click"
-                width="260"
+                width="300"
               >
                 <template #reference>
                   <el-button size="small" link type="primary">设置</el-button>
                 </template>
                 <div class="flex flex-col gap-2 text-xs">
                   <div class="flex items-center justify-between gap-2">
-                    <span>静默超时（秒）</span>
+                    <span>结束确认（秒）</span>
                     <el-input-number
                       v-model="row.data.inactivityTimeout"
                       :min="0"
@@ -572,7 +572,12 @@ onMounted(loadBase);
                       style="width: 110px"
                     />
                   </div>
-                  <div class="text-gray-400">0 表示默认 30 秒；持续期间不再有事件即判定结束</div>
+                  <div class="text-gray-400">
+                    0 表示默认 30 秒。最后一次「活动」信号后持续这么久没有再次活动，
+                    才推送结束通知；摄像头一次移动会反复上报开始/停止，窗口内的
+                    true / false 翻转算同一轮，不会重复推送开始/结束消息。
+                    调小可让结束通知更快，但间隔较长的动作可能被拆成多轮。
+                  </div>
                   <div class="flex items-center justify-between">
                     <span>开始通知</span>
                     <el-switch v-model="row.data.notifyStart" size="small" />
@@ -603,7 +608,8 @@ onMounted(loadBase);
         说明：事件主题按层级展示（RuleEngine → CellMotionDetector → Motion …），父类层级仅做分组，
         勾选、编辑名称与绑定渠道只作用于最后一级事件；「平铺」视图也只显示最后一级。<br />
         事件到达后按勾选主题做匹配（支持以 /* 结尾通配子树）再推送到所选渠道；未选渠道的事件仍会写入事件日志数据库。
-        抓取到的新事件会自动预填中文名称，该名称作为 <code>title</code> 字段随 webhook 一起推送，未填写时回退为主题最后一段。
+        抓取到的新事件会自动预填中文名称，该名称作为 <code>title</code> 字段随 webhook 一起推送，未填写时回退为主题最后一段。<br />
+        「持续」模式下，摄像头上报的每一条原始事件仍全部写入事件日志（不外发），只有一轮的开始 / 结束两条通知会推送到所选渠道。
       </div>
     </el-card>
   </div>

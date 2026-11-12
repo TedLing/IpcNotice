@@ -2,12 +2,19 @@
 //
 // 状态机（每个事件实例独立）：
 //
-//	IDLE + 活动事件        → ACTIVE，产生 started 通知
-//	ACTIVE + 活动事件      → 刷新 last_seen_at / event_count，不产生通知
-//	ACTIVE + 明确结束事件  → IDLE，产生 ended（EXPLICIT_STOP）
-//	IDLE + 明确结束事件    → 忽略
-//	ACTIVE + 静默超时      → IDLE，产生 ended（INACTIVITY_TIMEOUT，且链路健康时才判定）
-//	活动结束后再次活动     → 新一轮 started
+//	IDLE + 活动事件              → ACTIVE，产生 started 通知
+//	ACTIVE + 活动事件            → 刷新 last_seen / event_count，取消结束候选，不通知
+//	ACTIVE + 明确停止信号        → 仅标记结束候选（不刷新 last_seen），不通知
+//	ACTIVE(候选) + 活动事件      → 取消候选，继续本轮，不产生新的 started
+//	ACTIVE + 静默超时            → IDLE，产生 ended（且链路健康时才判定）
+//	IDLE + 明确停止 / Deleted    → 忽略
+//
+// 关键固件约束：TP-Link 每 1~2 秒上报一次 Is* 状态，一次持续移动会 true/false
+// 反复翻转（实测活动期内 false 段最长 16.5 秒）。因此「明确停止信号」绝不能
+// 直接结束本轮，否则一对 started/ended 会被放大成几十对推送。改为：停止信号
+// 只作为结束候选，由 inactivity_timeout（默认 30 秒，从最后一次活动信号起算）
+// 统一确认；窗口内再次活动即取消候选。end_reason=EXPLICIT_STOP 表示「收到过
+// 明确停止信号且经静默确认」，INACTIVITY_TIMEOUT 表示「无停止信号、纯静默结束」。
 //
 // 所有状态转换在互斥锁内完成，保证原子性；结束通知绕过冷却去重，独立匹配通道。
 package dispatch
@@ -84,7 +91,13 @@ type eventState struct {
 	sourceJSON string
 	active     bool
 	startedAt  time.Time
-	lastSeen   time.Time
+	// lastSeen 是最后一次「活动信号」时间，只有活动事件会刷新；明确停止信号
+	// （Is*=false / Motion.Active=false）不刷新它，否则设备持续推 false 心跳
+	// 会让静默超时永远无法触发。
+	lastSeen time.Time
+	// stopAt 是活动期内首次明确停止信号的时间（零值表示无结束候选）。
+	// 仅用于判定 end_reason，不影响超时计时；窗口内再次活动会清零。
+	stopAt     time.Time
 	eventCount int
 	lastEvent  Event // 最近一条原始事件，用于构造 ended 通知的基础字段
 	settings   sustainedSettings
@@ -96,19 +109,17 @@ func stateKey(device, topic string, source map[string]string) string {
 	return strings.Join([]string{device, util.NormalizeTopic(topic), util.JSONDump(source)}, "|")
 }
 
-// classifyActivity 判断事件是否为「活动 / 明确结束 / 忽略」。
+// classifyActivity 判断事件是「活动信号 / 明确停止信号 / 忽略」。
 // 优先级：PropertyOperation=Deleted 忽略（不视为结束）→ Motion 结构化字段 →
 // Data 中 Is* 布尔键（IsMotion/IsPeople/IsVehicle...）。无布尔信号的事件
-// 视为活动但不明确（只能靠静默超时结束），不凭主题名猜测。
-func classifyActivity(evt Event) (activity, explicit, ignore bool) {
+// 视为活动信号但不明确，只能靠结束确认窗口判定结束，不凭主题名猜测。
+// 注意：明确停止信号只登记结束候选，不直接结束本轮（见 processSustained）。
+func classifyActivity(evt Event) (activity, ignore bool) {
 	if strings.EqualFold(evt.Operation, "Deleted") {
-		return false, false, true
+		return false, true
 	}
 	if evt.Motion != nil {
-		if evt.Motion.Active {
-			return true, true, false
-		}
-		return false, true, false
+		return evt.Motion.Active, false
 	}
 	trues, falses := 0, 0
 	for k, v := range evt.Data {
@@ -123,23 +134,25 @@ func classifyActivity(evt Event) (activity, explicit, ignore bool) {
 		}
 	}
 	if trues > 0 {
-		return true, true, false
+		return true, false
 	}
 	if falses > 0 {
-		return false, true, false
+		return false, false
 	}
-	return true, false, false
+	return true, false
 }
 
 // processSustained 把原始事件交给状态机：原始事件照常入队落库（不推 webhook），
-// 状态转换产生 started/ended 生命周期通知（绕过冷却去重，走 sustained 通道）。
+// 本函数只在 IDLE→ACTIVE 时产生 started 通知；ended 由 scanInactivity 在结束
+// 确认窗口到期后统一产生（见文件头状态机说明）。两者都绕过冷却去重，
+// 只走匹配到的 sustained 订阅通道。
 func (d *Dispatcher) processSustained(dev *config.DeviceConfig, raw Event, s sustainedSettings) {
 	// 原始事件永远落库（保留原始事件日志，不因持续去重而丢弃）。
 	d.enqueueItem(dispatchItem{evt: raw, route: &routeDirect{
 		channels: s.channels, names: s.names, matched: true, push: false,
 	}}, dev.Name, raw.Topic)
 
-	activity, explicit, ignore := classifyActivity(raw)
+	activity, ignore := classifyActivity(raw)
 	if ignore {
 		return
 	}
@@ -156,58 +169,53 @@ func (d *Dispatcher) processSustained(dev *config.DeviceConfig, raw Event, s sus
 	}
 	st.topic = util.NormalizeTopic(raw.Topic)
 
-	var lifecycle Event
-	pushLifecycle := false
-	// 快照：锁内复制通道/名称等设置，锁外只使用局部快照。
-	// st.settings 可能被其他事件协程更新（携带更具体规则的活动事件），
-	// 解锁后再读 st 即为数据竞争；started 分支直接用入参 s（值拷贝，安全）。
-	var channels []store.WebhookChannel
-	var names string
-	switch {
-	case !st.active && !activity:
-		// IDLE + 明确结束 → 忽略
-		d.smMu.Unlock()
-		return
-	case st.active && !activity:
-		// ACTIVE + 明确结束 → ended(EXPLICIT_STOP)
-		endedAt := now
-		lifecycle = d.buildLifecycleEvent(st, raw, PhaseEnded, EndExplicit, endedAt)
-		st.active = false
-		pushLifecycle = st.settings.notifyEnd
-		channels, names = st.settings.channels, st.settings.names
-		d.persistState(st, PhaseEnded, EndExplicit, endedAt)
-		d.smMu.Unlock()
-	case !st.active:
-		// IDLE + 活动 → 新一轮 ACTIVE + started
+	if !st.active {
+		if !activity {
+			// IDLE + 明确停止信号：不开启新一轮（TP-Link 停后仍会补发数条 false）。
+			d.smMu.Unlock()
+			return
+		}
+		// IDLE + 活动 → 新一轮 ACTIVE + started。
 		st.active = true
 		st.startedAt = now
 		st.lastSeen = now
+		st.stopAt = time.Time{}
 		st.eventCount = 1
 		st.settings = s
 		st.lastEvent = raw
-		lifecycle = d.buildLifecycleEvent(st, raw, PhaseStarted, "", now)
-		pushLifecycle = s.notifyStart
-		channels, names = s.channels, s.names
+		lifecycle := d.buildLifecycleEvent(st, raw, PhaseStarted, "", now)
+		channels, names, push := s.channels, s.names, s.notifyStart
 		d.persistState(st, PhaseStarted, "", now)
 		d.smMu.Unlock()
-	default:
-		// ACTIVE + 活动 → 仅刷新，不产生通知；重复事件优先内存，不写库
-		st.lastSeen = now
-		st.eventCount++
-		st.lastEvent = raw
-		if explicit && s.timeout != st.settings.timeout {
-			st.settings = s // 活动事件携带更具体的规则时同步设置
-		}
-		d.smMu.Unlock()
+		// 锁外入队：只使用锁内复制的局部快照，不读 st。
+		d.enqueueItem(dispatchItem{evt: lifecycle, route: &routeDirect{
+			channels: channels, names: names,
+			matched: true, push: push,
+		}}, dev.Name, lifecycle.Topic)
 		return
 	}
 
-	// 锁外入队：lifecycle 通知绕过冷却去重，直接走 sustained 通道。
-	// 只使用锁内复制的局部快照，不读 st。
-	d.enqueueItem(dispatchItem{evt: lifecycle, route: &routeDirect{
-		channels: channels, names: names,
-		matched: true, push: pushLifecycle,
-	}}, dev.Name, lifecycle.Topic)
+	// ACTIVE：设置随 Reload 热更新（s 是值拷贝，锁内赋值安全），
+	// 保证活动期内修改通道/通知开关/静默超时也能作用于本轮 ended。
+	st.settings = s
+	if activity {
+		// 活动信号：刷新活动计时并取消结束候选，不产生任何通知。
+		// 这是折叠 true/false 抖动的关键——抖动后再出现 true 不算新一轮。
+		st.lastSeen = now
+		st.stopAt = time.Time{}
+		st.eventCount++
+		st.lastEvent = raw
+		d.smMu.Unlock()
+		return
+	}
+	// 明确停止信号：只登记结束候选，不刷新 lastSeen、不结束、不通知。
+	// 设备停止后往往还会连发数条 false 心跳；若在这里立即结束并推送，
+	// 一次移动侦测就会被放大成几十对 started/ended。
+	if st.stopAt.IsZero() {
+		st.stopAt = now
+	}
+	st.lastEvent = raw
+	d.smMu.Unlock()
 }
 
 // buildLifecycleEvent 以最近原始事件为基础构造生命周期通知信封。
@@ -223,7 +231,13 @@ func (d *Dispatcher) buildLifecycleEvent(st *eventState, raw Event, phase, reaso
 	if phase == PhaseEnded {
 		out.EndedAt = at.UTC().Format(time.RFC3339Nano)
 		out.EndReason = reason
-		out.DurationSeconds = int64(at.Sub(st.startedAt).Seconds())
+		// 持续时间按「开始 → 最后一次活动信号」计算，不把结束确认窗口
+		// （静默超时）算进事件本身；否则一次 5 秒的移动会显示成 35 秒。
+		dur := int64(st.lastSeen.Sub(st.startedAt).Seconds())
+		if dur < 0 {
+			dur = 0
+		}
+		out.DurationSeconds = dur
 	}
 	return out
 }
@@ -264,7 +278,11 @@ func (d *Dispatcher) scanLoop() {
 	}
 }
 
-// scanInactivity 把静默超时的 ACTIVE 状态判定为结束（INACTIVITY_TIMEOUT）。
+// scanInactivity 统一的结束确认：每秒检查一次 ACTIVE 状态，只有「最后一次
+// 活动信号之后持续 inactivity_timeout 没有任何活动信号」才判定本轮结束。
+// 明确停止信号（Is*=false）只登记候选、不参与计时，因此设备 stop 后连发的
+// false 心跳不会让本轮无限延长，活动期内的 false 抖动也不会提前结束。
+// end_reason：期间收到过明确停止信号 → EXPLICIT_STOP；纯静默 → INACTIVITY_TIMEOUT。
 // 设备订阅/接收链路不健康（断网、订阅失效、Worker 异常）时不误判。
 func (d *Dispatcher) scanInactivity() {
 	now := d.smNow()
@@ -294,8 +312,14 @@ func (d *Dispatcher) scanInactivity() {
 			continue // 链路异常，不能认定活动结束
 		}
 		st.active = false
-		evt := d.buildLifecycleEvent(st, st.lastEvent, PhaseEnded, EndInactivity, now)
-		d.persistState(st, PhaseEnded, EndInactivity, now)
+		reason := EndInactivity
+		if !st.stopAt.IsZero() {
+			// 收到过明确停止信号且经过静默确认：保留原有 end_reason 取值，
+			// 便于既有 webhook 消费方区分「设备报停」与「纯静默超时」。
+			reason = EndExplicit
+		}
+		evt := d.buildLifecycleEvent(st, st.lastEvent, PhaseEnded, reason, now)
+		d.persistState(st, PhaseEnded, reason, now)
 		// 锁内复制需要的快照，解锁后只使用局部值（st 可能被其他协程并发更新）。
 		emissions = append(emissions, emission{
 			evt: evt, device: st.device,
